@@ -1,0 +1,8 @@
+numpy>=1.24
+scipy>=1.10
+matplotlib>=3.7
+pyyaml>=6.0
+tqdm>=4.65
+torch>=2.0
+zuko>=1.0
+pytest>=7.0
