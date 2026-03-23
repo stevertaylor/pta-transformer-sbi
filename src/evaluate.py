@@ -222,13 +222,14 @@ def main():
 
             # Posterior comparison plots (no-mask only)
             if sev == 0.0:
+                model_eval_dir = ensure_dir(os.path.join(eval_dir, name))
                 for k in range(min(4, len(res["exact_posts"]))):
                     ep = res["exact_posts"][k]
                     plot_posterior_comparison(
                         ep["log10_A_grid"], ep["gamma_grid"],
                         ep["posterior"], res["learned_posts"][k],
                         res["true_thetas"][k],
-                        os.path.join(eval_dir, f"posterior_{name}_{k}.png"),
+                        os.path.join(model_eval_dir, f"posterior_{k}.png"),
                         title=f"{name} – test example {k}",
                     )
 
@@ -236,7 +237,7 @@ def main():
                 plot_pp(
                     res["percentiles"],
                     ["log10_A_red", "gamma_red"],
-                    os.path.join(eval_dir, f"pp_{name}.png"),
+                    os.path.join(model_eval_dir, "pp.png"),
                     ks_stats=[res["ks_log10A"], res["ks_gamma"]],
                     title=f"P-P plot – {name}",
                 )

@@ -41,4 +41,4 @@ eval:
   n_test_exact: 30
   masking_levels: [0.0, 0.3, 0.6]
 
-output_dir: outputs/transformer_v2
+output_dir: outputs/v2

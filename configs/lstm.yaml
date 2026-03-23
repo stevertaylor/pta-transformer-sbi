@@ -1,6 +1,6 @@
 # LSTM default config
 data:
-  train_samples: 20000
+  train_samples: 50000
   val_samples: 2000
   test_samples: 2000
   n_fourier_modes: 30
@@ -18,16 +18,16 @@ model:
   d_model: 128
   nhead: 4
   num_layers: 4
-  dim_feedforward: 256
+  dim_feedforward: 512
   dropout: 0.1
-  context_dim: 64
+  context_dim: 128
   lstm_hidden: 128
   lstm_layers: 2
   flow_transforms: 6
   flow_hidden: 128
 
 training:
-  epochs: 40
+  epochs: 100
   batch_size: 64
   lr: 3.0e-4
   weight_decay: 1.0e-4
@@ -41,4 +41,4 @@ eval:
   n_test_exact: 30
   masking_levels: [0.0, 0.3, 0.6]
 
-output_dir: outputs/lstm
+output_dir: outputs/v2
