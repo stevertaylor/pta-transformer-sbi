@@ -39,10 +39,13 @@ def collate_fn(batch: List[dict]) -> dict:
             features[i, :L, j] = item["tokens"][key]
         backend_id[i, :L] = item["tokens"]["backend_id"]
 
+    tspan_yr = torch.stack([item["tspan_yr"] for item in batch])
+
     return {
         "theta": theta,
         "features": features,
         "backend_id": backend_id,
         "mask": mask,
         "seq_lens": torch.tensor(seq_lens, dtype=torch.long),
+        "tspan_yr": tspan_yr,
     }

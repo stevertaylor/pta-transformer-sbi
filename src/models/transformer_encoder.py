@@ -1,4 +1,9 @@
-"""Transformer encoder over TOA tokens → context vector."""
+"""Transformer encoder over TOA tokens → context vector.
+
+Supports two modes:
+- Legacy (use_rope=False): Additive TimeEmbedding, CLS token, post-norm TransformerEncoder
+- Modern (use_rope=True): RoPE, pre-norm blocks, attention pooling
+"""
 
 from __future__ import annotations
 
@@ -7,6 +12,10 @@ import torch
 import torch.nn as nn
 from typing import Optional
 
+
+# ---------------------------------------------------------------------------
+# Shared: token feature MLP
+# ---------------------------------------------------------------------------
 
 class TimeEmbedding(nn.Module):
     """Learned continuous-time embedding from (t_norm, dt_prev) → d_model."""
@@ -20,25 +29,131 @@ class TimeEmbedding(nn.Module):
         )
 
     def forward(self, t_norm: torch.Tensor, dt_prev: torch.Tensor) -> torch.Tensor:
-        """
-        Parameters
-        ----------
-        t_norm, dt_prev : (B, L)
-        Returns : (B, L, d_model)
-        """
-        x = torch.stack([t_norm, torch.log1p(dt_prev.clamp(min=0.0))], dim=-1)  # (B, L, 2)
+        x = torch.stack([t_norm, torch.log1p(dt_prev.clamp(min=0.0))], dim=-1)
         return self.mlp(x)
 
 
-class TransformerEncoderModel(nn.Module):
-    """Transformer encoder: tokens → CLS summary → context vector.
+# ---------------------------------------------------------------------------
+# RoPE components (for use_rope=True path)
+# ---------------------------------------------------------------------------
 
-    Architecture:
-    1. Token MLP: continuous features → d_model
-    2. Learned time embedding added to token embedding
-    3. Prepend learnable CLS token
-    4. Standard transformer encoder (batch_first)
-    5. CLS output projected to context_dim
+class RotaryEmbedding(nn.Module):
+    """Continuous-time rotary position embedding."""
+
+    def __init__(self, d_k: int, base: float = 10000.0):
+        super().__init__()
+        inv_freq = 1.0 / (base ** (torch.arange(0, d_k, 2).float() / d_k))
+        self.register_buffer("inv_freq", inv_freq)
+
+    def forward(self, positions: torch.Tensor):
+        """positions: (B, L) continuous time values → cos, sin each (B, L, d_k//2)."""
+        freqs = positions.unsqueeze(-1) * self.inv_freq  # (B, L, d_k//2)
+        return freqs.cos(), freqs.sin()
+
+
+def _apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Apply rotary embedding to Q or K.
+
+    x:   (B, nhead, L, d_k)
+    cos: (B, L, d_k//2)
+    sin: (B, L, d_k//2)
+    """
+    d_half = x.shape[-1] // 2
+    x1, x2 = x[..., :d_half], x[..., d_half:]
+    cos = cos[:, None, :, :]  # (B, 1, L, d_half)
+    sin = sin[:, None, :, :]
+    return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+
+
+class RoPESelfAttention(nn.Module):
+    """Multi-head self-attention with rotary position embeddings on Q and K."""
+
+    def __init__(self, d_model: int, nhead: int, dropout: float = 0.0):
+        super().__init__()
+        assert d_model % nhead == 0
+        self.nhead = nhead
+        self.d_k = d_model // nhead
+        self.scale = self.d_k ** -0.5
+
+        self.W_qkv = nn.Linear(d_model, 3 * d_model)
+        self.W_out = nn.Linear(d_model, d_model)
+        self.attn_drop = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        rope_cos: torch.Tensor,
+        rope_sin: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        B, L, D = x.shape
+        qkv = self.W_qkv(x).reshape(B, L, 3, self.nhead, self.d_k)
+        q, k, v = qkv.unbind(2)            # each (B, L, nhead, d_k)
+        q = q.transpose(1, 2)              # (B, nhead, L, d_k)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        q = _apply_rotary_emb(q, rope_cos, rope_sin)
+        k = _apply_rotary_emb(k, rope_cos, rope_sin)
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale  # (B, nhead, L, L)
+        if key_padding_mask is not None:
+            attn = attn.masked_fill(key_padding_mask[:, None, None, :], float("-inf"))
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        out = (attn @ v).transpose(1, 2).reshape(B, L, D)
+        return self.W_out(out)
+
+
+class PreNormBlock(nn.Module):
+    """Pre-norm transformer block with RoPE self-attention."""
+
+    def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(d_model)
+        self.attn = RoPESelfAttention(d_model, nhead, dropout)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x, rope_cos, rope_sin, key_padding_mask=None):
+        x = x + self.attn(self.norm1(x), rope_cos, rope_sin, key_padding_mask)
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+
+class AttentionPooling(nn.Module):
+    """Learned scalar attention pooling over a masked sequence."""
+
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.score_proj = nn.Linear(d_model, 1)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """x: (B, L, d_model), mask: (B, L) True=valid → (B, d_model)."""
+        scores = self.score_proj(x).squeeze(-1)          # (B, L)
+        scores = scores.masked_fill(~mask, float("-inf"))
+        weights = scores.softmax(dim=-1).unsqueeze(-1)   # (B, L, 1)
+        return (x * weights).sum(dim=1)
+
+
+# ---------------------------------------------------------------------------
+# Main encoder
+# ---------------------------------------------------------------------------
+
+class TransformerEncoderModel(nn.Module):
+    """Transformer encoder: tokens → summary → context vector.
+
+    When use_rope=False (legacy):
+        Additive TimeEmbedding + CLS token + post-norm nn.TransformerEncoder
+    When use_rope=True (modern):
+        Rotary position embeddings + pre-norm blocks + attention pooling
     """
 
     def __init__(
@@ -52,11 +167,16 @@ class TransformerEncoderModel(nn.Module):
         context_dim: int = 64,
         n_backends: int = 4,
         backend_embed_dim: int = 8,
+        use_rope: bool = False,
+        rope_base: float = 10000.0,
+        position_scale: float = 512.0,
     ):
         super().__init__()
         self.d_model = d_model
+        self.use_rope = use_rope
+        self.position_scale = position_scale
 
-        # Token feature MLP
+        # Token feature MLP (shared)
         in_dim = n_cont_features + backend_embed_dim
         self.backend_embed = nn.Embedding(n_backends, backend_embed_dim)
         self.token_mlp = nn.Sequential(
@@ -65,22 +185,27 @@ class TransformerEncoderModel(nn.Module):
             nn.Linear(d_model, d_model),
         )
 
-        # Time embedding
-        self.time_embed = TimeEmbedding(d_model)
-
-        # CLS token
-        self.cls_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
-
-        # Transformer
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            batch_first=True,
-            activation="gelu",
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        if use_rope:
+            d_k = d_model // nhead
+            self.rope = RotaryEmbedding(d_k, base=rope_base)
+            self.blocks = nn.ModuleList([
+                PreNormBlock(d_model, nhead, dim_feedforward, dropout)
+                for _ in range(num_layers)
+            ])
+            self.final_norm = nn.LayerNorm(d_model)
+            self.pool = AttentionPooling(d_model)
+        else:
+            self.time_embed = TimeEmbedding(d_model)
+            self.cls_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=nhead,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                batch_first=True,
+                activation="gelu",
+            )
+            self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
         # Context projection
         self.context_proj = nn.Sequential(
@@ -108,24 +233,34 @@ class TransformerEncoderModel(nn.Module):
         B, L, _ = features.shape
 
         # Token embedding
-        be = self.backend_embed(backend_id)              # (B, L, be_dim)
-        tok_in = torch.cat([features, be], dim=-1)       # (B, L, in_dim)
-        tok_emb = self.token_mlp(tok_in)                 # (B, L, d_model)
+        be = self.backend_embed(backend_id)
+        tok_in = torch.cat([features, be], dim=-1)
+        tok_emb = self.token_mlp(tok_in)
 
-        # Time embedding (features[:, :, 0] = t_norm, [:, :, 1] = dt_prev)
-        t_emb = self.time_embed(features[:, :, 0], features[:, :, 1])
-        tok_emb = tok_emb + t_emb
+        if self.use_rope:
+            # Modern path: RoPE + pre-norm + attention pooling
+            positions = features[:, :, 0] * self.position_scale
+            rope_cos, rope_sin = self.rope(positions)
+            pad_mask = ~mask
 
-        # Prepend CLS
-        cls = self.cls_token.expand(B, -1, -1)           # (B, 1, d_model)
-        seq = torch.cat([cls, tok_emb], dim=1)            # (B, 1+L, d_model)
+            x = tok_emb
+            for block in self.blocks:
+                x = block(x, rope_cos, rope_sin, key_padding_mask=pad_mask)
+            x = self.final_norm(x)
+            pooled = self.pool(x, mask)
+        else:
+            # Legacy path: additive time embed + CLS + standard transformer
+            t_emb = self.time_embed(features[:, :, 0], features[:, :, 1])
+            tok_emb = tok_emb + t_emb
 
-        # Build causal-free attention mask: True positions are IGNORED
-        cls_mask = torch.ones(B, 1, dtype=torch.bool, device=mask.device)
-        full_mask = torch.cat([cls_mask, mask], dim=1)    # (B, 1+L)
-        src_key_padding_mask = ~full_mask                 # True = pad → ignore
+            cls = self.cls_token.expand(B, -1, -1)
+            seq = torch.cat([cls, tok_emb], dim=1)
 
-        out = self.transformer(seq, src_key_padding_mask=src_key_padding_mask)
-        cls_out = out[:, 0, :]                            # (B, d_model)
+            cls_mask = torch.ones(B, 1, dtype=torch.bool, device=mask.device)
+            full_mask = torch.cat([cls_mask, mask], dim=1)
+            src_key_padding_mask = ~full_mask
 
-        return self.context_proj(cls_out)                 # (B, context_dim)
+            out = self.transformer(seq, src_key_padding_mask=src_key_padding_mask)
+            pooled = out[:, 0, :]
+
+        return self.context_proj(pooled)

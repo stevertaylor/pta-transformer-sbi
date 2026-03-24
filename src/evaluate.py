@@ -62,6 +62,7 @@ def _make_batch_single(sim_item, mask_keep=None, device="cpu"):
 
     tokens = tokenize(t, sigma, r, freq, be)
     L = len(t)
+    tspan_yr = float(t.max() - t.min()) if L > 1 else 0.0
 
     feat_keys = ["t_norm", "dt_prev", "r_over_sig", "log_sigma", "r_raw", "freq_norm"]
     features = torch.stack([tokens[k] for k in feat_keys], dim=-1).unsqueeze(0)
@@ -73,6 +74,7 @@ def _make_batch_single(sim_item, mask_keep=None, device="cpu"):
         "features": features.to(device),
         "backend_id": backend_id.to(device),
         "mask": mask.to(device),
+        "tspan_yr": torch.tensor([tspan_yr], dtype=torch.float32).to(device),
     }
 
 

@@ -73,8 +73,10 @@ def main():
     features = torch.stack([tokens[k] for k in feat_keys], dim=-1).unsqueeze(0).to(device)
     backend_id = tokens["backend_id"].unsqueeze(0).to(device)
     mask = torch.ones(1, len(sim.t), dtype=torch.bool, device=device)
+    tspan_yr = torch.tensor([float(sim.t.max() - sim.t.min())], dtype=torch.float32).to(device)
     batch = {"theta": torch.from_numpy(sim.theta).unsqueeze(0).to(device),
-             "features": features, "backend_id": backend_id, "mask": mask}
+             "features": features, "backend_id": backend_id, "mask": mask,
+             "tspan_yr": tspan_yr}
 
     # Sample learned posterior
     samples = model.sample_posterior(batch, n_samples=5000)  # (1, 5000, 2)

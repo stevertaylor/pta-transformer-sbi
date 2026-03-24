@@ -20,13 +20,16 @@ class PosteriorFlow(nn.Module):
         context_dim: int = 64,
         n_transforms: int = 6,
         hidden_features: int = 128,
+        n_hidden_layers: int = 2,
+        n_bins: int = 8,
     ):
         super().__init__()
         self.flow = zuko.flows.NSF(
             features=theta_dim,
             context=context_dim,
             transforms=n_transforms,
-            hidden_features=[hidden_features, hidden_features],
+            hidden_features=[hidden_features] * n_hidden_layers,
+            bins=n_bins,
         )
 
     def log_prob(self, theta: torch.Tensor, context: torch.Tensor) -> torch.Tensor:

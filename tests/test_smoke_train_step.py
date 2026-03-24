@@ -37,6 +37,7 @@ def _make_dummy_batch(B=8, L_max=40, n_feat=6):
         "backend_id": backend_id,
         "mask": mask,
         "seq_lens": seq_lens,
+        "tspan_yr": torch.rand(B) * 10 + 5,
     }
 
 

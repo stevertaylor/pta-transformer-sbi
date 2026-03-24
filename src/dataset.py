@@ -76,11 +76,13 @@ class PulsarDataset(Dataset):
         backend_k = sim.backend_id[keep]
 
         tokens = tokenize(t_k, sigma_k, r_k, freq_k, backend_k)
+        tspan_yr = float(t_k.max() - t_k.min()) if len(t_k) > 1 else 0.0
 
         return {
             "theta": torch.from_numpy(sim.theta),
             "tokens": tokens,
             "seq_len": len(t_k),
+            "tspan_yr": torch.tensor(tspan_yr, dtype=torch.float32),
         }
 
 
@@ -108,10 +110,12 @@ class FixedPulsarDataset(Dataset):
             n_modes = data_cfg.get("n_fourier_modes", 30)
             sim = simulate_pulsar(theta, schedule, n_modes=n_modes, rng=rng)
             tokens = tokenize(sim.t, sim.sigma, sim.residuals, sim.freq_mhz, sim.backend_id)
+            tspan_yr = float(sim.t.max() - sim.t.min()) if len(sim.t) > 1 else 0.0
             self.items.append({
                 "theta": torch.from_numpy(sim.theta),
                 "tokens": tokens,
                 "seq_len": len(sim.t),
+                "tspan_yr": torch.tensor(tspan_yr, dtype=torch.float32),
                 "sim": sim,
             })
 
