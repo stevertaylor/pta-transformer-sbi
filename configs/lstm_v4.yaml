@@ -1,0 +1,62 @@
+# v4 LSTM config – 7-parameter noise model on RTX 4090
+# Matches transformer_v4 data/flow/training settings
+data:
+  train_samples: 200000
+  val_samples: 5000
+  test_samples: 5000
+  n_fourier_modes: 30
+  n_toa_min: 80
+  n_toa_max: 400
+  tspan_min_yr: 5.0
+  tspan_max_yr: 15.0
+  jitter: 1.0e-20
+
+prior:
+  log10_A_red: [-17, -11]
+  gamma_red: [0.5, 6.5]
+  log10_A_dm: [-17, -11]
+  gamma_dm: [0.5, 6.5]
+  EFAC: [0.5, 2.0]
+  log10_EQUAD: [-8, -5]
+  log10_ECORR: [-8, -5]
+
+model:
+  # Encoder (LSTM-specific)
+  d_model: 256
+  lstm_hidden: 256
+  lstm_layers: 3
+  dropout: 0.05
+  context_dim: 128
+  use_aux_features: true
+
+  # Transformer keys (unused for LSTM, kept for shared config compat)
+  nhead: 8
+  num_layers: 6
+  dim_feedforward: 1024
+  use_rope: false
+
+  # Normalizing flow (theta_dim=7 determined from prior)
+  flow_transforms: 10
+  flow_hidden: 256
+  flow_layers: 3
+  flow_bins: 16
+
+training:
+  epochs: 200
+  batch_size: 256
+  lr: 5.0e-4
+  weight_decay: 1.0e-4
+  grad_clip: 5.0
+  patience: 20
+  seed: 42
+  warmup_fraction: 0.05
+  use_amp: true
+  num_workers: 4
+
+eval:
+  n_grid: 200
+  n_posterior_samples: 10000
+  n_test_exact: 100
+  masking_levels: [0.0, 0.15, 0.3, 0.45, 0.6]
+
+output_dir: outputs/v4

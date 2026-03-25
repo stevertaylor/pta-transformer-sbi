@@ -36,10 +36,11 @@ class NPEModel(nn.Module):
         self.flow = flow
         self.use_aux = use_aux
         # Theta normalization buffers (set from prior bounds in build_model)
+        theta_dim = flow.flow.features if hasattr(flow.flow, "features") else 2
         if theta_mean is None:
-            theta_mean = torch.zeros(2)
+            theta_mean = torch.zeros(theta_dim)
         if theta_std is None:
-            theta_std = torch.ones(2)
+            theta_std = torch.ones(theta_dim)
         self.register_buffer("theta_mean", theta_mean)
         self.register_buffer("theta_std", theta_std)
 
@@ -95,7 +96,7 @@ class NPEModel(nn.Module):
 
     @torch.no_grad()
     def sample_posterior(self, batch: dict, n_samples: int = 1000) -> torch.Tensor:
-        """Sample from learned posterior. Returns (B, n_samples, 2)."""
+        """Sample from learned posterior. Returns (B, n_samples, theta_dim)."""
         context = self._get_flow_context(batch)
         samples_norm = self.flow.sample(context, n_samples)
         return self._denormalize_theta(samples_norm)
@@ -107,7 +108,7 @@ class NPEModel(nn.Module):
         Parameters
         ----------
         batch : dict with a single example (B=1)
-        grid_points : (G, 2) grid of theta values
+        grid_points : (G, theta_dim) grid of theta values
 
         Returns
         -------
@@ -129,12 +130,12 @@ def build_model(model_type: str, cfg: dict) -> NPEModel:
     use_aux = mcfg.get("use_aux_features", False)
     flow_context_dim = context_dim + (N_AUX_FEATURES if use_aux else 0)
 
-    # Compute theta normalization from prior bounds → maps to ~[-1, 1]
+    # Compute theta dimension and normalization from prior bounds
     prior_cfg = cfg.get("prior", {})
-    log10_A_bounds = prior_cfg.get("log10_A_red", [-17, -11])
-    gamma_bounds = prior_cfg.get("gamma_red", [0.5, 6.5])
-    lo = torch.tensor([log10_A_bounds[0], gamma_bounds[0]])
-    hi = torch.tensor([log10_A_bounds[1], gamma_bounds[1]])
+    param_names = list(prior_cfg.keys())
+    theta_dim = len(param_names)
+    lo = torch.tensor([prior_cfg[k][0] for k in param_names], dtype=torch.float32)
+    hi = torch.tensor([prior_cfg[k][1] for k in param_names], dtype=torch.float32)
     theta_mean = (lo + hi) / 2
     theta_std = (hi - lo) / 2
 
@@ -162,7 +163,7 @@ def build_model(model_type: str, cfg: dict) -> NPEModel:
         raise ValueError(f"Unknown model type: {model_type}")
 
     flow = PosteriorFlow(
-        theta_dim=2,
+        theta_dim=theta_dim,
         context_dim=flow_context_dim,
         n_transforms=mcfg["flow_transforms"],
         hidden_features=mcfg["flow_hidden"],

@@ -1,41 +1,49 @@
-"""Uniform prior over the 2-D parameter vector theta = (log10_A_red, gamma_red).
+"""Uniform prior over the D-dimensional parameter vector theta.
 
-All units are arbitrary simulator units – see README for details.
+The parameter dimension and bounds are read from the config dict whose
+keys define the canonical parameter ordering.
 """
 
 from __future__ import annotations
 
 import torch
 import numpy as np
-from typing import Tuple
+from typing import Tuple, List
 
 
 class UniformPrior:
-    """Axis-aligned uniform prior on a 2-D box."""
+    """Axis-aligned uniform prior on a D-dimensional box."""
 
     def __init__(self, bounds: dict):
         """
         Parameters
         ----------
         bounds : dict
-            Must contain keys ``log10_A_red`` and ``gamma_red``, each mapping
-            to a [low, high] list.
+            Ordered mapping of parameter name → [low, high].
+            Example::
+
+                {"log10_A_red": [-17, -11],
+                 "gamma_red": [0.5, 6.5],
+                 "log10_A_dm": [-17, -11],
+                 ...}
         """
+        self.param_names: List[str] = list(bounds.keys())
         self.lo = torch.tensor(
-            [bounds["log10_A_red"][0], bounds["gamma_red"][0]], dtype=torch.float32
+            [bounds[k][0] for k in self.param_names], dtype=torch.float32
         )
         self.hi = torch.tensor(
-            [bounds["log10_A_red"][1], bounds["gamma_red"][1]], dtype=torch.float32
+            [bounds[k][1] for k in self.param_names], dtype=torch.float32
         )
         self.log_vol = torch.log(self.hi - self.lo).sum()
 
     # ------------------------------------------------------------------
     def sample(self, n: int, rng: np.random.Generator | None = None) -> torch.Tensor:
-        """Return (n, 2) tensor of prior samples."""
+        """Return (n, D) tensor of prior samples."""
+        D = len(self.param_names)
         if rng is None:
-            u = torch.rand(n, 2)
+            u = torch.rand(n, D)
         else:
-            u = torch.from_numpy(rng.random((n, 2)).astype(np.float32))
+            u = torch.from_numpy(rng.random((n, D)).astype(np.float32))
         return self.lo + u * (self.hi - self.lo)
 
     def log_prob(self, theta: torch.Tensor) -> torch.Tensor:
@@ -46,7 +54,7 @@ class UniformPrior:
 
     @property
     def dim(self) -> int:
-        return 2
+        return len(self.param_names)
 
     @property
     def bounds_array(self) -> Tuple[np.ndarray, np.ndarray]:
