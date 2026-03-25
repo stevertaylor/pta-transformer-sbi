@@ -8,6 +8,10 @@ from src.models.model_wrappers import build_model
 @pytest.fixture
 def smoke_cfg():
     return {
+        "prior": {
+            "log10_A_red": [-17, -11],
+            "gamma_red": [0.5, 6.5],
+        },
         "model": {
             "d_model": 32,
             "nhead": 2,
@@ -19,13 +23,17 @@ def smoke_cfg():
             "lstm_layers": 1,
             "flow_transforms": 2,
             "flow_hidden": 32,
-        }
+        },
     }
 
 
 @pytest.fixture
 def v3_cfg():
     return {
+        "prior": {
+            "log10_A_red": [-17, -11],
+            "gamma_red": [0.5, 6.5],
+        },
         "model": {
             "d_model": 32,
             "nhead": 2,
@@ -41,7 +49,7 @@ def v3_cfg():
             "flow_bins": 8,
             "use_rope": True,
             "use_aux_features": True,
-        }
+        },
     }
 
 
@@ -108,6 +116,7 @@ def test_posterior_sampling(smoke_cfg):
 
 
 # --- v3 architecture tests (RoPE + aux features) ---
+
 
 def test_transformer_rope_forward(v3_cfg):
     model = build_model("transformer", v3_cfg)

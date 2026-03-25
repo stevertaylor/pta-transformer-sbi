@@ -11,8 +11,9 @@ from __future__ import annotations
 import numpy as np
 import torch
 from typing import Tuple, Optional
+from scipy.linalg import solve_triangular
 
-from .simulator import build_fourier_design_matrix, power_law_spectrum
+from .simulator import build_fourier_design_matrix, power_law_spectrum, SEC_PER_YR
 
 
 def _log_likelihood_single(
@@ -23,7 +24,7 @@ def _log_likelihood_single(
     n_modes: int,
     log10_A: float,
     gamma: float,
-    jitter: float = 1e-6,
+    jitter: float = 1e-20,
 ) -> float:
     """Exact log p(r | θ) for one (log10_A, gamma) pair.
 
@@ -35,7 +36,10 @@ def _log_likelihood_single(
     phi_diag = np.repeat(rho, 2).astype(np.float64)
 
     F64 = F.astype(np.float64)
-    C = np.diag(sigma.astype(np.float64) ** 2 + jitter) + F64 @ np.diag(phi_diag) @ F64.T
+    C = (
+        np.diag(sigma.astype(np.float64) ** 2 + jitter)
+        + F64 @ np.diag(phi_diag) @ F64.T
+    )
 
     # Cholesky
     try:
@@ -57,20 +61,67 @@ def compute_log_likelihood_grid(
     n_modes: int,
     log10_A_grid: np.ndarray,
     gamma_grid: np.ndarray,
-    jitter: float = 1e-6,
+    jitter: float = 1e-20,
 ) -> np.ndarray:
-    """Evaluate log-likelihood on a 2-D grid.
+    """Evaluate log-likelihood on a 2-D grid using the Woodbury identity.
+
+    Exploits the low-rank structure C = D + F Φ Fᵀ to decompose a
+    (2·n_modes × 2·n_modes) matrix instead of (N × N) at each grid point,
+    giving a large speedup when N >> 2·n_modes.
 
     Returns shape (len(log10_A_grid), len(gamma_grid)).
     """
+    N = len(residuals)
+    K = 2 * n_modes
     nA = len(log10_A_grid)
     nG = len(gamma_grid)
+
+    # --- Precompute whitened quantities (independent of θ) ---
+    d = sigma.astype(np.float64) ** 2 + jitter
+    d_inv_sqrt = 1.0 / np.sqrt(d)
+    F64 = F.astype(np.float64)
+    G = F64 * d_inv_sqrt[:, None]  # D^{-1/2} F
+    r_w = residuals.astype(np.float64) * d_inv_sqrt  # D^{-1/2} r
+
+    GtG = G.T @ G  # (K, K)
+    Gtr = G.T @ r_w  # (K,)
+    rtr = float(np.dot(r_w, r_w))
+    log_det_D = float(np.sum(np.log(d)))
+    const_term = N * np.log(2.0 * np.pi)
+
+    # --- Vectorise spectrum components over the grid ---
+    fk = np.arange(1, n_modes + 1, dtype=np.float64) / tspan
+    delta_f = 1.0 / tspan
+    prefactor = SEC_PER_YR**2 / (12.0 * np.pi**2) * delta_f
+
+    A2 = (10.0 ** log10_A_grid.astype(np.float64)) ** 2
+    fk_pow = np.exp(np.outer(-gamma_grid.astype(np.float64), np.log(fk)))
+
     ll = np.full((nA, nG), -np.inf, dtype=np.float64)
-    for i, lA in enumerate(log10_A_grid):
-        for j, g in enumerate(gamma_grid):
-            ll[i, j] = _log_likelihood_single(
-                residuals, sigma, F, tspan, n_modes, float(lA), float(g), jitter
-            )
+    diag_idx = np.arange(K)
+
+    for i in range(nA):
+        for j in range(nG):
+            rho = A2[i] * prefactor * fk_pow[j]
+            phi_diag = np.repeat(rho, 2)
+
+            M = GtG.copy()
+            M[diag_idx, diag_idx] += 1.0 / phi_diag
+
+            try:
+                L = np.linalg.cholesky(M)
+            except np.linalg.LinAlgError:
+                continue
+
+            log_det_Phi = np.sum(np.log(phi_diag))
+            log_det_M = 2.0 * np.sum(np.log(np.diag(L)))
+            log_det_C = log_det_D + log_det_Phi + log_det_M
+
+            alpha = solve_triangular(L, Gtr, lower=True)
+            quad = rtr - float(np.dot(alpha, alpha))
+
+            ll[i, j] = -0.5 * (const_term + log_det_C + quad)
+
     return ll
 
 
@@ -83,7 +134,7 @@ def exact_posterior_grid(
     n_modes: int,
     prior_bounds: dict,
     n_grid: int = 100,
-    jitter: float = 1e-6,
+    jitter: float = 1e-20,
 ) -> dict:
     """Compute the exact normalised posterior on a regular grid.
 

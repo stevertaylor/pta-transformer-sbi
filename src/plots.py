@@ -65,7 +65,20 @@ def plot_pp(
 ) -> None:
     """P-P / calibration plot: empirical CDF vs uniform diagonal."""
     fig, ax = plt.subplots(figsize=(5, 5))
+    n_realizations = percentiles.shape[0]
     x = np.linspace(0, 1, 200)
+    std = np.sqrt(x * (1 - x) / n_realizations)
+
+    # 1, 2, 3 sigma confidence bands
+    for n_sigma, alpha in [(3, 0.06), (2, 0.12), (1, 0.20)]:
+        ax.fill_between(
+            x,
+            x - n_sigma * std,
+            x + n_sigma * std,
+            color="gray",
+            alpha=alpha,
+            label=f"${n_sigma}\\sigma$" if n_sigma == 3 else f"${n_sigma}\\sigma$",
+        )
 
     for d, name in enumerate(param_names):
         sorted_p = np.sort(percentiles[:, d])

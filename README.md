@@ -30,21 +30,21 @@ The simulator generates irregular, variable-length, gappy observation schedules 
 | Number of pulsars | 1 | 20–100 |
 | Parameters | 2 (red noise) | Hundreds (DM, timing model, GWB, ...) |
 | Timing model | None (residuals given) | Full multi-parameter fit |
-| Units | Arbitrary simulator units | Physical (seconds, Hz, strain) |
+| Units | Physical (seconds, yr⁻¹, strain) | Physical (seconds, Hz, strain) |
 | White noise | Diagonal, known σ | EFAC/EQUAD/ECORR |
 | Likelihood | Exact Gaussian | Same form but much larger |
 | Schedule | Synthetic seasonal | Real observatory logs |
 
 ### Units and scaling
 
-All quantities are in **arbitrary simulator units**:
+All quantities use the **standard PTA / enterprise convention**:
 - Times are in years
-- TOA uncertainties σ are log-uniform in [10⁻², 10⁰] (arbitrary)
-- Red-noise amplitude A_red = 10^(log10_A_red), with log10_A_red ∈ [−2.5, −0.5]
+- TOA uncertainties σ are in seconds, log-uniform in [10⁻⁷, 10⁻⁵] (100 ns – 10 μs)
+- Red-noise amplitude A_red = 10^(log10_A_red), with log10_A_red ∈ [−17, −11]
 - Spectral index gamma_red ∈ [0.5, 6.5]
 - Reference frequency f_ref = 1.0 yr⁻¹
-- Per-mode variance: ρ_k = A² · (f_k/f_ref)^(−γ) · Δf
-- Covariance: C = diag(σ²) + F·Φ(θ)·Fᵀ + jitter·I  with jitter = 10⁻⁶
+- Per-mode variance: ρ_k = (A² / 12π²) · yr² · (f_k/f_ref)^(−γ) · Δf   (in s²)
+- Covariance: C = diag(σ²) + F·Φ(θ)·Fᵀ + jitter·I  with jitter = 10⁻²⁰
 
 ## Installation
 

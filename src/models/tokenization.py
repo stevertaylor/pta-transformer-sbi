@@ -39,6 +39,9 @@ def tokenize(
     sigma32 = sigma.astype(np.float32)
     r32 = residuals.astype(np.float32)
     r_over_sig = r32 / (sigma32 + eps)
+    # Signed-log transform: compresses extreme values while preserving sign.
+    # Raw r_over_sig can reach 1e5 for strong red noise, overflowing float16.
+    r_over_sig = np.sign(r_over_sig) * np.log1p(np.abs(r_over_sig))
     log_sigma = np.log10(sigma32 + eps)
 
     if freq_mhz is not None:

@@ -8,10 +8,10 @@ data:
   n_toa_max: 400
   tspan_min_yr: 5.0
   tspan_max_yr: 15.0
-  jitter: 1.0e-6
+  jitter: 1.0e-20
 
 prior:
-  log10_A_red: [-2.5, -0.5]
+  log10_A_red: [-17, -11]
   gamma_red: [0.5, 6.5]
 
 model:

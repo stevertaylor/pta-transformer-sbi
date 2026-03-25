@@ -24,17 +24,28 @@ from .models.model_wrappers import build_model
 from .exact_posterior import exact_posterior_grid
 from .masking import apply_random_masking
 from .models.tokenization import tokenize
-from .metrics import hellinger_distance_grid, calibration_percentiles, ks_statistic, point_estimate_error
+from .metrics import (
+    hellinger_distance_grid,
+    calibration_percentiles,
+    ks_statistic,
+    point_estimate_error,
+)
 from .plots import plot_posterior_comparison, plot_pp, plot_robustness
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="Evaluate NPE models")
     p.add_argument("--config", type=str, required=True)
-    p.add_argument("--checkpoint", type=str, required=True, help="Transformer checkpoint")
-    p.add_argument("--baseline-checkpoint", type=str, default=None, help="LSTM checkpoint")
+    p.add_argument(
+        "--checkpoint", type=str, required=True, help="Transformer checkpoint"
+    )
+    p.add_argument(
+        "--baseline-checkpoint", type=str, default=None, help="LSTM checkpoint"
+    )
     p.add_argument("--output-dir", type=str, default=None)
-    p.add_argument("--device", type=str, default=None, help="Force device (cpu/cuda/mps)")
+    p.add_argument(
+        "--device", type=str, default=None, help="Force device (cpu/cuda/mps)"
+    )
     return p.parse_args()
 
 
@@ -79,12 +90,19 @@ def _make_batch_single(sim_item, mask_keep=None, device="cpu"):
 
 
 def evaluate_model(
-    model, dataset, cfg, device, n_exact, n_grid, n_posterior_samples,
-    masking_severity=0.0, seed=999,
+    model,
+    dataset,
+    cfg,
+    device,
+    n_exact,
+    n_grid,
+    n_posterior_samples,
+    masking_severity=0.0,
+    seed=999,
 ):
     """Run full evaluation for one model at one masking level."""
     prior_bounds = cfg["prior"]
-    jitter = cfg["data"].get("jitter", 1e-6)
+    jitter = cfg["data"].get("jitter", 1e-20)
 
     hellinger_dists = []
     all_true = []
@@ -111,8 +129,14 @@ def evaluate_model(
 
         # Exact posterior
         exact = exact_posterior_grid(
-            sim.residuals, sim.sigma, sim.F, sim.tspan, sim.n_modes,
-            prior_bounds, n_grid=n_grid, jitter=jitter,
+            sim.residuals,
+            sim.sigma,
+            sim.F,
+            sim.tspan,
+            sim.n_modes,
+            prior_bounds,
+            n_grid=n_grid,
+            jitter=jitter,
         )
 
         # Learned posterior on grid
@@ -122,7 +146,9 @@ def evaluate_model(
         grid_pts = torch.stack([AA.reshape(-1), GG.reshape(-1)], dim=-1).to(device)
 
         log_probs = model.log_prob_on_grid(batch, grid_pts)
-        log_probs_np = log_probs.cpu().numpy().reshape(n_grid, n_grid).astype(np.float64)
+        log_probs_np = (
+            log_probs.cpu().numpy().reshape(n_grid, n_grid).astype(np.float64)
+        )
 
         # Normalise learned posterior on grid
         dA = float(A_grid[1] - A_grid[0])
@@ -214,7 +240,10 @@ def main():
         for sev in masking_levels:
             print(f"  Masking severity: {sev}")
             res = evaluate_model(
-                model, test_ds, cfg, device,
+                model,
+                test_ds,
+                cfg,
+                device,
                 n_exact=ecfg["n_test_exact"],
                 n_grid=ecfg["n_grid"],
                 n_posterior_samples=ecfg["n_posterior_samples"],
@@ -228,8 +257,10 @@ def main():
                 for k in range(min(4, len(res["exact_posts"]))):
                     ep = res["exact_posts"][k]
                     plot_posterior_comparison(
-                        ep["log10_A_grid"], ep["gamma_grid"],
-                        ep["posterior"], res["learned_posts"][k],
+                        ep["log10_A_grid"],
+                        ep["gamma_grid"],
+                        ep["posterior"],
+                        res["learned_posts"][k],
                         res["true_thetas"][k],
                         os.path.join(model_eval_dir, f"posterior_{k}.png"),
                         title=f"{name} – test example {k}",
@@ -282,7 +313,9 @@ def main():
         print(f"\n  {name}:")
         for sev in summary[name]:
             s = summary[name][sev]
-            print(f"    mask={sev}: H={s['hellinger']:.4f} KS={s['ks_mean']:.4f} PE={s['point_error']:.4f}")
+            print(
+                f"    mask={sev}: H={s['hellinger']:.4f} KS={s['ks_mean']:.4f} PE={s['point_error']:.4f}"
+            )
 
 
 if __name__ == "__main__":

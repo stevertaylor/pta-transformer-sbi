@@ -4,7 +4,7 @@ Produces irregular, gappy, variable-length TOA schedules that mimic
 realistic radio-pulsar timing programmes (seasonal windows, cadence
 variations, missing seasons, variable baseline).
 
-All times are in *years*.
+Times are in years.  TOA uncertainties (sigma) are in seconds.
 """
 
 from __future__ import annotations
@@ -18,10 +18,10 @@ from typing import Optional
 class Schedule:
     """Container for one pulsar's observing schedule."""
 
-    t: np.ndarray              # observation times in years, shape (N,)
-    sigma: np.ndarray          # TOA uncertainty in arbitrary units, shape (N,)
-    freq_mhz: np.ndarray      # observing frequency in MHz, shape (N,)
-    backend_id: np.ndarray     # integer backend label, shape (N,)
+    t: np.ndarray  # observation times in years, shape (N,)
+    sigma: np.ndarray  # TOA uncertainty in arbitrary units, shape (N,)
+    freq_mhz: np.ndarray  # observing frequency in MHz, shape (N,)
+    backend_id: np.ndarray  # integer backend label, shape (N,)
 
     @property
     def n_toa(self) -> int:
@@ -95,7 +95,7 @@ def generate_schedule(
     n = len(t_all)
 
     # ---- uncertainties (heteroskedastic, log-uniform) ----
-    log_sig_low, log_sig_high = -2.0, 0.0  # arbitrary units
+    log_sig_low, log_sig_high = -7.0, -5.0  # seconds (100 ns to 10 μs)
     sigma = 10 ** rng.uniform(log_sig_low, log_sig_high, size=n).astype(np.float32)
 
     # ---- observing frequency ----

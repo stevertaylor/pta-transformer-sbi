@@ -3,7 +3,11 @@
 import numpy as np
 import pytest
 from src.schedules import generate_schedule
-from src.simulator import simulate_pulsar, build_fourier_design_matrix, power_law_spectrum
+from src.simulator import (
+    simulate_pulsar,
+    build_fourier_design_matrix,
+    power_law_spectrum,
+)
 
 
 def test_schedule_shape():
@@ -30,7 +34,7 @@ def test_fourier_design_matrix_shape():
 
 
 def test_power_law_spectrum():
-    rho = power_law_spectrum(n_modes=20, tspan=10.0, log10_A=-1.5, gamma=3.0)
+    rho = power_law_spectrum(n_modes=20, tspan=10.0, log10_A=-14.0, gamma=3.0)
     assert rho.shape == (20,)
     assert np.all(rho > 0)
     # Power law: lower frequencies should have more power
@@ -40,7 +44,7 @@ def test_power_law_spectrum():
 def test_simulate_pulsar_shape():
     rng = np.random.default_rng(1)
     sched = generate_schedule(rng)
-    theta = np.array([-1.5, 3.0], dtype=np.float32)
+    theta = np.array([-14.0, 3.0], dtype=np.float32)
     sim = simulate_pulsar(theta, sched, n_modes=20, rng=rng)
     N = sched.n_toa
     assert sim.residuals.shape == (N,)
@@ -53,6 +57,6 @@ def test_simulate_pulsar_shape():
 def test_simulate_pulsar_finite():
     rng = np.random.default_rng(2)
     sched = generate_schedule(rng)
-    theta = np.array([-1.0, 4.0], dtype=np.float32)
+    theta = np.array([-13.0, 4.0], dtype=np.float32)
     sim = simulate_pulsar(theta, sched, n_modes=20, rng=rng)
     assert np.all(np.isfinite(sim.residuals))

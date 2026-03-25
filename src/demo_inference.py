@@ -10,6 +10,7 @@ import argparse
 import numpy as np
 import torch
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
@@ -27,7 +28,9 @@ def parse_args():
     p.add_argument("--checkpoint", type=str, required=True)
     p.add_argument("--seed", type=int, default=12345)
     p.add_argument("--output", type=str, default="demo_inference.png")
-    p.add_argument("--device", type=str, default=None, help="Force device (cpu/cuda/mps)")
+    p.add_argument(
+        "--device", type=str, default=None, help="Force device (cpu/cuda/mps)"
+    )
     return p.parse_args()
 
 
@@ -57,10 +60,18 @@ def main():
 
     # Exact posterior
     exact = exact_posterior_grid(
-        sim.residuals, sim.sigma, sim.F, sim.tspan, sim.n_modes,
-        cfg["prior"], n_grid=80, jitter=cfg["data"].get("jitter", 1e-6),
+        sim.residuals,
+        sim.sigma,
+        sim.F,
+        sim.tspan,
+        sim.n_modes,
+        cfg["prior"],
+        n_grid=80,
+        jitter=cfg["data"].get("jitter", 1e-20),
     )
-    print(f"Exact MAP: log10_A={exact['map_theta'][0]:.3f}, gamma={exact['map_theta'][1]:.3f}")
+    print(
+        f"Exact MAP: log10_A={exact['map_theta'][0]:.3f}, gamma={exact['map_theta'][1]:.3f}"
+    )
 
     # Load model
     model = build_model(model_type, cfg).to(device)
@@ -70,13 +81,21 @@ def main():
     # Prepare batch
     tokens = tokenize(sim.t, sim.sigma, sim.residuals, sim.freq_mhz, sim.backend_id)
     feat_keys = ["t_norm", "dt_prev", "r_over_sig", "log_sigma", "r_raw", "freq_norm"]
-    features = torch.stack([tokens[k] for k in feat_keys], dim=-1).unsqueeze(0).to(device)
+    features = (
+        torch.stack([tokens[k] for k in feat_keys], dim=-1).unsqueeze(0).to(device)
+    )
     backend_id = tokens["backend_id"].unsqueeze(0).to(device)
     mask = torch.ones(1, len(sim.t), dtype=torch.bool, device=device)
-    tspan_yr = torch.tensor([float(sim.t.max() - sim.t.min())], dtype=torch.float32).to(device)
-    batch = {"theta": torch.from_numpy(sim.theta).unsqueeze(0).to(device),
-             "features": features, "backend_id": backend_id, "mask": mask,
-             "tspan_yr": tspan_yr}
+    tspan_yr = torch.tensor([float(sim.t.max() - sim.t.min())], dtype=torch.float32).to(
+        device
+    )
+    batch = {
+        "theta": torch.from_numpy(sim.theta).unsqueeze(0).to(device),
+        "features": features,
+        "backend_id": backend_id,
+        "mask": mask,
+        "tspan_yr": tspan_yr,
+    }
 
     # Sample learned posterior
     samples = model.sample_posterior(batch, n_samples=5000)  # (1, 5000, 2)
@@ -94,9 +113,16 @@ def main():
     axes[0].set_ylabel("gamma_red")
 
     # Learned posterior (histogram of samples)
-    axes[1].hist2d(samples_np[:, 0], samples_np[:, 1], bins=40, cmap="Blues",
-                   range=[[exact["log10_A_grid"][0], exact["log10_A_grid"][-1]],
-                          [exact["gamma_grid"][0], exact["gamma_grid"][-1]]])
+    axes[1].hist2d(
+        samples_np[:, 0],
+        samples_np[:, 1],
+        bins=40,
+        cmap="Blues",
+        range=[
+            [exact["log10_A_grid"][0], exact["log10_A_grid"][-1]],
+            [exact["gamma_grid"][0], exact["gamma_grid"][-1]],
+        ],
+    )
     axes[1].plot(theta[0], theta[1], "r*", ms=14)
     axes[1].set_title(f"Learned posterior ({model_type})")
     axes[1].set_xlabel("log10_A_red")
