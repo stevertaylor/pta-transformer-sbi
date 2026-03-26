@@ -28,7 +28,7 @@ model:
   num_layers: 6
   dim_feedforward: 1024
   dropout: 0.05
-  context_dim: 128
+  context_dim: 256
   use_rope: true
   use_aux_features: true
 
@@ -60,4 +60,4 @@ eval:
   n_test_exact: 100
   masking_levels: [0.0, 0.15, 0.3, 0.45, 0.6]
 
-output_dir: outputs/v4b
+output_dir: outputs/v4c

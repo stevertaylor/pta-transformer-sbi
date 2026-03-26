@@ -27,7 +27,7 @@ model:
   lstm_hidden: 256
   lstm_layers: 3
   dropout: 0.05
-  context_dim: 128
+  context_dim: 256
   use_aux_features: true
 
   # Transformer keys (unused for LSTM, kept for shared config compat)
@@ -60,4 +60,4 @@ eval:
   n_test_exact: 100
   masking_levels: [0.0, 0.15, 0.3, 0.45, 0.6]
 
-output_dir: outputs/v4b
+output_dir: outputs/v4c

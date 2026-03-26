@@ -17,6 +17,7 @@ from typing import Optional
 # Shared: token feature MLP
 # ---------------------------------------------------------------------------
 
+
 class TimeEmbedding(nn.Module):
     """Learned continuous-time embedding from (t_norm, dt_prev) → d_model."""
 
@@ -37,6 +38,7 @@ class TimeEmbedding(nn.Module):
 # RoPE components (for use_rope=True path)
 # ---------------------------------------------------------------------------
 
+
 class RotaryEmbedding(nn.Module):
     """Continuous-time rotary position embedding."""
 
@@ -51,7 +53,9 @@ class RotaryEmbedding(nn.Module):
         return freqs.cos(), freqs.sin()
 
 
-def _apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+def _apply_rotary_emb(
+    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> torch.Tensor:
     """Apply rotary embedding to Q or K.
 
     x:   (B, nhead, L, d_k)
@@ -73,7 +77,7 @@ class RoPESelfAttention(nn.Module):
         assert d_model % nhead == 0
         self.nhead = nhead
         self.d_k = d_model // nhead
-        self.scale = self.d_k ** -0.5
+        self.scale = self.d_k**-0.5
 
         self.W_qkv = nn.Linear(d_model, 3 * d_model)
         self.W_out = nn.Linear(d_model, d_model)
@@ -88,8 +92,8 @@ class RoPESelfAttention(nn.Module):
     ) -> torch.Tensor:
         B, L, D = x.shape
         qkv = self.W_qkv(x).reshape(B, L, 3, self.nhead, self.d_k)
-        q, k, v = qkv.unbind(2)            # each (B, L, nhead, d_k)
-        q = q.transpose(1, 2)              # (B, nhead, L, d_k)
+        q, k, v = qkv.unbind(2)  # each (B, L, nhead, d_k)
+        q = q.transpose(1, 2)  # (B, nhead, L, d_k)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
@@ -137,15 +141,44 @@ class AttentionPooling(nn.Module):
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """x: (B, L, d_model), mask: (B, L) True=valid → (B, d_model)."""
-        scores = self.score_proj(x).squeeze(-1)          # (B, L)
+        scores = self.score_proj(x).squeeze(-1)  # (B, L)
         scores = scores.masked_fill(~mask, float("-inf"))
-        weights = scores.softmax(dim=-1).unsqueeze(-1)   # (B, L, 1)
+        weights = scores.softmax(dim=-1).unsqueeze(-1)  # (B, L, 1)
         return (x * weights).sum(dim=1)
+
+
+class CLSQueryPooling(nn.Module):
+    """Learned [CLS] query token with multi-head cross-attention pooling.
+
+    A single learned query vector attends over the encoder output sequence,
+    allowing the model to learn *what* information to extract rather than
+    relying on a fixed reduction (mean or scalar-attention).
+    """
+
+    def __init__(self, d_model: int, nhead: int, dropout: float = 0.0):
+        super().__init__()
+        self.query = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        self.cross_attn = nn.MultiheadAttention(
+            d_model,
+            nhead,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """x: (B, L, d_model), mask: (B, L) True=valid → (B, d_model)."""
+        B = x.shape[0]
+        q = self.query.expand(B, -1, -1)  # (B, 1, d_model)
+        key_padding_mask = ~mask  # True = ignore
+        out, _ = self.cross_attn(q, x, x, key_padding_mask=key_padding_mask)
+        return self.norm(out.squeeze(1))  # (B, d_model)
 
 
 # ---------------------------------------------------------------------------
 # Main encoder
 # ---------------------------------------------------------------------------
+
 
 class TransformerEncoderModel(nn.Module):
     """Transformer encoder: tokens → summary → context vector.
@@ -188,12 +221,14 @@ class TransformerEncoderModel(nn.Module):
         if use_rope:
             d_k = d_model // nhead
             self.rope = RotaryEmbedding(d_k, base=rope_base)
-            self.blocks = nn.ModuleList([
-                PreNormBlock(d_model, nhead, dim_feedforward, dropout)
-                for _ in range(num_layers)
-            ])
+            self.blocks = nn.ModuleList(
+                [
+                    PreNormBlock(d_model, nhead, dim_feedforward, dropout)
+                    for _ in range(num_layers)
+                ]
+            )
             self.final_norm = nn.LayerNorm(d_model)
-            self.pool = AttentionPooling(d_model)
+            self.pool = CLSQueryPooling(d_model, nhead, dropout)
         else:
             self.time_embed = TimeEmbedding(d_model)
             self.cls_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
@@ -205,7 +240,9 @@ class TransformerEncoderModel(nn.Module):
                 batch_first=True,
                 activation="gelu",
             )
-            self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+            self.transformer = nn.TransformerEncoder(
+                encoder_layer, num_layers=num_layers
+            )
 
         # Context projection
         self.context_proj = nn.Sequential(
