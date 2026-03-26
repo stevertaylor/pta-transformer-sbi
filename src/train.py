@@ -30,7 +30,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--config", type=str, required=True, help="Path to YAML config")
     p.add_argument("--model", type=str, required=True, choices=["transformer", "lstm"])
     p.add_argument("--output-dir", type=str, default=None, help="Override output dir")
-    p.add_argument("--device", type=str, default=None, help="Force device (cpu/cuda/mps)")
+    p.add_argument(
+        "--device", type=str, default=None, help="Force device (cpu/cuda/mps)"
+    )
     return p.parse_args()
 
 
@@ -40,7 +42,10 @@ def train_one_epoch(model, loader, optimizer, device, grad_clip, scaler=None):
     n = 0
     use_amp = scaler is not None
     for batch in loader:
-        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+        batch = {
+            k: v.to(device) if isinstance(v, torch.Tensor) else v
+            for k, v in batch.items()
+        }
         with torch.autocast(device.type, enabled=use_amp):
             loss = model(batch)
         optimizer.zero_grad()
@@ -67,7 +72,10 @@ def validate(model, loader, device, use_amp=False):
     total_loss = 0.0
     n = 0
     for batch in loader:
-        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+        batch = {
+            k: v.to(device) if isinstance(v, torch.Tensor) else v
+            for k, v in batch.items()
+        }
         with torch.autocast(device.type, enabled=use_amp):
             loss = model(batch)
         total_loss += loss.item() * batch["theta"].shape[0]
@@ -94,6 +102,7 @@ def main():
     prior = UniformPrior(cfg["prior"])
 
     # Datasets
+    use_sobol = cfg.get("data", {}).get("use_sobol", False)
     train_ds = PulsarDataset(
         n_samples=cfg["data"]["train_samples"],
         prior=prior,
@@ -101,6 +110,7 @@ def main():
         seed=tcfg["seed"],
         masking_severity=0.5,
         augment=True,
+        use_sobol=use_sobol,
     )
     val_ds = PulsarDataset(
         n_samples=cfg["data"]["val_samples"],
@@ -144,7 +154,9 @@ def main():
 
     # LR scheduler: optional linear warmup + cosine annealing
     warmup_fraction = tcfg.get("warmup_fraction", 0.0)
-    warmup_epochs = max(1, int(warmup_fraction * tcfg["epochs"])) if warmup_fraction > 0 else 0
+    warmup_epochs = (
+        max(1, int(warmup_fraction * tcfg["epochs"])) if warmup_fraction > 0 else 0
+    )
     if warmup_epochs > 0:
         warmup_sched = torch.optim.lr_scheduler.LinearLR(
             optimizer, start_factor=0.01, total_iters=warmup_epochs
@@ -153,9 +165,13 @@ def main():
             optimizer, T_max=tcfg["epochs"] - warmup_epochs
         )
         scheduler = torch.optim.lr_scheduler.SequentialLR(
-            optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[warmup_epochs]
+            optimizer,
+            schedulers=[warmup_sched, cosine_sched],
+            milestones=[warmup_epochs],
         )
-        print(f"LR schedule: {warmup_epochs} warmup + {tcfg['epochs'] - warmup_epochs} cosine")
+        print(
+            f"LR schedule: {warmup_epochs} warmup + {tcfg['epochs'] - warmup_epochs} cosine"
+        )
     else:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=tcfg["epochs"]
@@ -174,7 +190,9 @@ def main():
 
     for epoch in range(1, tcfg["epochs"] + 1):
         t0 = time.time()
-        tl = train_one_epoch(model, train_loader, optimizer, device, tcfg["grad_clip"], scaler)
+        tl = train_one_epoch(
+            model, train_loader, optimizer, device, tcfg["grad_clip"], scaler
+        )
         vl = validate(model, val_loader, device, use_amp)
         scheduler.step()
         dt = time.time() - t0
@@ -182,20 +200,25 @@ def main():
         train_losses.append(tl)
         val_losses.append(vl)
         lr_now = optimizer.param_groups[0]["lr"]
-        print(f"Epoch {epoch:3d}/{tcfg['epochs']}  train={tl:.4f}  val={vl:.4f}  lr={lr_now:.2e}  [{dt:.1f}s]")
+        print(
+            f"Epoch {epoch:3d}/{tcfg['epochs']}  train={tl:.4f}  val={vl:.4f}  lr={lr_now:.2e}  [{dt:.1f}s]"
+        )
 
         if vl < best_val:
             best_val = vl
             patience_counter = 0
             ckpt_path = os.path.join(out_dir, "best_model.pt")
-            torch.save({
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "val_loss": vl,
-                "config": cfg,
-                "model_type": args.model,
-            }, ckpt_path)
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "val_loss": vl,
+                    "config": cfg,
+                    "model_type": args.model,
+                },
+                ckpt_path,
+            )
         else:
             patience_counter += 1
             if patience_counter >= tcfg["patience"]:
@@ -204,7 +227,8 @@ def main():
 
     # Save final artifacts
     plot_training_curves(
-        train_losses, val_losses,
+        train_losses,
+        val_losses,
         os.path.join(out_dir, "training_curves.png"),
         title=f"{args.model} training curves",
     )

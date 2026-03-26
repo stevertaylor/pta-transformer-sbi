@@ -1,13 +1,15 @@
 """Uniform prior over the D-dimensional parameter vector theta.
 
 The parameter dimension and bounds are read from the config dict whose
-keys define the canonical parameter ordering.
+keys define the canonical parameter ordering.  Supports Sobol (quasi-random)
+sampling for better coverage of high-dimensional prior spaces.
 """
 
 from __future__ import annotations
 
 import torch
 import numpy as np
+from scipy.stats.qmc import Sobol
 from typing import Tuple, List
 
 
@@ -38,12 +40,24 @@ class UniformPrior:
 
     # ------------------------------------------------------------------
     def sample(self, n: int, rng: np.random.Generator | None = None) -> torch.Tensor:
-        """Return (n, D) tensor of prior samples."""
+        """Return (n, D) tensor of iid uniform prior samples."""
         D = len(self.param_names)
         if rng is None:
             u = torch.rand(n, D)
         else:
             u = torch.from_numpy(rng.random((n, D)).astype(np.float32))
+        return self.lo + u * (self.hi - self.lo)
+
+    def sample_sobol(self, n: int, seed: int = 42) -> torch.Tensor:
+        """Return (n, D) tensor of scrambled Sobol quasi-random samples.
+
+        Sobol sequences provide better coverage of the prior volume than
+        iid sampling, with discrepancy O(log^d N / N) vs O(1/sqrt(N)).
+        Scrambling preserves low-discrepancy while breaking lattice artifacts.
+        """
+        D = len(self.param_names)
+        sampler = Sobol(d=D, scramble=True, seed=seed)
+        u = torch.from_numpy(sampler.random(n).astype(np.float32))
         return self.lo + u * (self.hi - self.lo)
 
     def log_prob(self, theta: torch.Tensor) -> torch.Tensor:

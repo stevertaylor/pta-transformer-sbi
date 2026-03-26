@@ -15,7 +15,7 @@ prior:
   gamma_red: [0.5, 6.5]
   log10_A_dm: [-17, -11]
   gamma_dm: [0.5, 6.5]
-  EFAC: [0.5, 2.0]
+  EFAC: [0.1, 10.0]
   log10_EQUAD: [-8, -5]
   log10_ECORR: [-8, -5]
 

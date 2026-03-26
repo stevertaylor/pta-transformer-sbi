@@ -19,7 +19,7 @@ class PulsarDataset(Dataset):
 
     Each __getitem__ call:
     1. Seeds an RNG from (base_seed + index).
-    2. Draws theta ~ prior.
+    2. Draws theta from pre-generated Sobol array (or samples from prior).
     3. Generates a schedule.
     4. Simulates residuals.
     5. Optionally applies masking augmentations.
@@ -34,6 +34,7 @@ class PulsarDataset(Dataset):
         seed: int = 0,
         masking_severity: float = 0.0,
         augment: bool = False,
+        use_sobol: bool = False,
     ):
         self.n_samples = n_samples
         self.prior = prior
@@ -42,12 +43,22 @@ class PulsarDataset(Dataset):
         self.masking_severity = masking_severity
         self.augment = augment
 
+        # Pre-generate all theta values for better prior coverage
+        if use_sobol:
+            self._theta_bank = prior.sample_sobol(n_samples, seed=seed).numpy()
+        else:
+            self._theta_bank = None
+
     def __len__(self) -> int:
         return self.n_samples
 
     def __getitem__(self, idx: int) -> dict:
         rng = np.random.default_rng(self.seed + idx)
-        theta = self.prior.sample(1, rng=rng).squeeze(0).numpy()
+
+        if self._theta_bank is not None:
+            theta = self._theta_bank[idx]
+        else:
+            theta = self.prior.sample(1, rng=rng).squeeze(0).numpy()
 
         schedule = generate_schedule(
             rng,
@@ -109,15 +120,19 @@ class FixedPulsarDataset(Dataset):
             )
             n_modes = data_cfg.get("n_fourier_modes", 30)
             sim = simulate_pulsar(theta, schedule, n_modes=n_modes, rng=rng)
-            tokens = tokenize(sim.t, sim.sigma, sim.residuals, sim.freq_mhz, sim.backend_id)
+            tokens = tokenize(
+                sim.t, sim.sigma, sim.residuals, sim.freq_mhz, sim.backend_id
+            )
             tspan_yr = float(sim.t.max() - sim.t.min()) if len(sim.t) > 1 else 0.0
-            self.items.append({
-                "theta": torch.from_numpy(sim.theta),
-                "tokens": tokens,
-                "seq_len": len(sim.t),
-                "tspan_yr": torch.tensor(tspan_yr, dtype=torch.float32),
-                "sim": sim,
-            })
+            self.items.append(
+                {
+                    "theta": torch.from_numpy(sim.theta),
+                    "tokens": tokens,
+                    "seq_len": len(sim.t),
+                    "tspan_yr": torch.tensor(tspan_yr, dtype=torch.float32),
+                    "sim": sim,
+                }
+            )
 
     def __len__(self) -> int:
         return len(self.items)
