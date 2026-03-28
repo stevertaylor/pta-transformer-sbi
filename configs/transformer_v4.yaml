@@ -1,5 +1,5 @@
-# v4 config – 7-parameter noise model on RTX 4090
-# Stage 2: adds DM noise, EFAC, EQUAD, ECORR to the red-noise model
+# v4d config – CLS query pooling + stronger flow
+# context_dim=128 (reverted), flow_transforms=10, flow_hidden=256
 data:
   train_samples: 500000
   val_samples: 10000
@@ -28,7 +28,7 @@ model:
   num_layers: 6
   dim_feedforward: 1024
   dropout: 0.05
-  context_dim: 256
+  context_dim: 128
   use_rope: true
   use_aux_features: true
 
@@ -37,8 +37,8 @@ model:
   lstm_layers: 3
 
   # Normalizing flow (theta_dim=7 determined from prior)
-  flow_transforms: 8
-  flow_hidden: 192
+  flow_transforms: 10
+  flow_hidden: 256
   flow_layers: 3
   flow_bins: 16
 
@@ -60,4 +60,4 @@ eval:
   n_test_exact: 100
   masking_levels: [0.0, 0.15, 0.3, 0.45, 0.6]
 
-output_dir: outputs/v4c
+output_dir: outputs/v4d
