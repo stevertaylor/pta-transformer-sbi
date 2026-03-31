@@ -135,7 +135,14 @@ python -m pytest tests/ -v
 │   ├── test_models.py
 │   └── test_smoke_train_step.py
 ├── outputs/                # Generated checkpoints, plots, metrics
-├── tutorial_sbi_framework.ipynb  # Interactive tutorial notebook
+├── tutorial_sbi_framework.ipynb  # Interactive overview tutorial
+├── tutorials/                    # In-depth tutorial series (5 notebooks)
+│   ├── README.md
+│   ├── 01_synthetic_data.ipynb
+│   ├── 02_data_pipeline.ipynb
+│   ├── 03_model_architecture.ipynb
+│   ├── 04_training.ipynb
+│   └── 05_evaluation.ipynb
 └── requirements.txt
 ```
 
@@ -280,6 +287,16 @@ flowchart TB
 - **Theta normalisation**: Prior bounds are used to map θ to approximately [−1, 1] before the flow, keeping values within the NSF spline domain.
 - **Structured masking augmentations**: Season dropout, end truncation, cadence thinning — not just iid random dropout.
 
-## Tutorial notebook
+## Tutorials
 
-`tutorial_sbi_framework.ipynb` provides an interactive walkthrough of the entire pipeline — from simulating data and computing exact posteriors to loading a trained model and demonstrating amortized inference. It is intended to be self-contained and accessible to physicists unfamiliar with SBI.
+`tutorial_sbi_framework.ipynb` provides an interactive overview of the entire pipeline — from simulating data and computing exact posteriors to loading a trained model and demonstrating amortized inference.
+
+The `tutorials/` folder contains a five-part deep-dive series:
+
+| # | Notebook | Topics |
+|---|---------|--------|
+| 1 | [Synthetic Data Generation](tutorials/01_synthetic_data.ipynb) | Schedules, priors, Fourier red noise, power-law spectrum, sensitivity |
+| 2 | [Data Pipeline](tutorials/02_data_pipeline.ipynb) | Tokenization, signed-log transform, masking augmentations, datasets, collation |
+| 3 | [Model Architecture](tutorials/03_model_architecture.ipynb) | Token embedding, RoPE, pre-norm blocks, attention pooling, NSF flow, LSTM comparison |
+| 4 | [Training](tutorials/04_training.ipynb) | Config system, NPE loss, LR scheduling, AMP, early stopping |
+| 5 | [Evaluation](tutorials/05_evaluation.ipynb) | Exact posteriors, Hellinger distance, P-P calibration, robustness |
