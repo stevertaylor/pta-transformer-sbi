@@ -42,7 +42,7 @@ DM_FREQ_REF = 1400.0  # MHz – reference frequency for chromatic DM scaling
 class SimulatedPulsar:
     """Everything needed for training and exact-likelihood evaluation."""
 
-    theta: np.ndarray  # (D,) parameter vector
+    theta: np.ndarray  # (D,) parameter vector (flat)
     t: np.ndarray  # (N,) observation times in years
     sigma: np.ndarray  # (N,) *raw* white-noise uncertainties (before EFAC/EQUAD)
     residuals: np.ndarray  # (N,) observed residuals
@@ -53,6 +53,10 @@ class SimulatedPulsar:
     tspan: float  # time span in years
     n_modes: int  # number of Fourier frequency modes
     F_dm: Optional[np.ndarray] = None  # (N, 2*n_modes) chromatic DM design matrix
+    # Factorized mode fields (v5+)
+    n_backends: int = 1
+    theta_global: Optional[np.ndarray] = None  # (4,) global params
+    theta_wn: Optional[np.ndarray] = None  # (n_backends, 3) per-backend WN
 
 
 def build_fourier_design_matrix(
@@ -215,4 +219,96 @@ def simulate_pulsar(
         tspan=tspan,
         n_modes=n_modes,
         F_dm=F_dm,
+    )
+
+
+def simulate_pulsar_factorized(
+    theta_global: np.ndarray,
+    theta_wn: np.ndarray,
+    schedule: Schedule,
+    n_modes: int = 30,
+    rng: Optional[np.random.Generator] = None,
+) -> SimulatedPulsar:
+    """Simulate residuals with per-backend white noise parameters.
+
+    Parameters
+    ----------
+    theta_global : (4,) [log10_A_red, gamma_red, log10_A_dm, gamma_dm]
+    theta_wn : (n_backends, 3) per-backend [EFAC, log10_EQUAD, log10_ECORR]
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    log10_A_red = float(theta_global[0])
+    gamma_red = float(theta_global[1])
+    log10_A_dm = float(theta_global[2])
+    gamma_dm = float(theta_global[3])
+
+    n_backends = theta_wn.shape[0]
+
+    t = schedule.t.copy()
+    sigma = schedule.sigma.copy()
+    tspan = float(t[-1] - t[0])
+    if tspan <= 0:
+        tspan = 1.0
+    N = len(t)
+
+    # --- achromatic red noise ---
+    F = build_fourier_design_matrix(t, tspan, n_modes)
+    rho_red = power_law_spectrum(n_modes, tspan, log10_A_red, gamma_red)
+    phi_red = np.repeat(rho_red, 2)
+    a_red = rng.normal(size=2 * n_modes).astype(np.float32) * np.sqrt(phi_red)
+    red_noise = F @ a_red
+
+    # --- DM noise (chromatic) ---
+    F_dm = build_dm_design_matrix(F, schedule.freq_mhz)
+    rho_dm = power_law_spectrum(n_modes, tspan, log10_A_dm, gamma_dm)
+    phi_dm = np.repeat(rho_dm, 2)
+    a_dm = rng.normal(size=2 * n_modes).astype(np.float32) * np.sqrt(phi_dm)
+    dm_noise = F_dm @ a_dm
+
+    # --- per-backend white noise + ECORR ---
+    white_noise = np.zeros(N, dtype=np.float32)
+    ecorr_noise = np.zeros(N, dtype=np.float32)
+
+    for b in range(n_backends):
+        b_mask = schedule.backend_id == b
+        if not b_mask.any():
+            continue
+        efac_b = float(theta_wn[b, 0])
+        equad_b = 10.0 ** float(theta_wn[b, 1])
+        ecorr_b = 10.0 ** float(theta_wn[b, 2])
+
+        sigma_eff_b = np.sqrt((efac_b * sigma[b_mask]) ** 2 + equad_b**2).astype(
+            np.float32
+        )
+        white_noise[b_mask] = (
+            rng.normal(size=int(b_mask.sum())).astype(np.float32) * sigma_eff_b
+        )
+
+        if ecorr_b > 0:
+            unique_epochs = np.unique(schedule.epoch_id[b_mask])
+            for e in unique_epochs:
+                e_b_mask = b_mask & (schedule.epoch_id == e)
+                ecorr_noise[e_b_mask] = rng.normal() * ecorr_b
+
+    residuals = red_noise + dm_noise + white_noise + ecorr_noise
+
+    theta_flat = np.concatenate([theta_global, theta_wn.reshape(-1)]).astype(np.float32)
+
+    return SimulatedPulsar(
+        theta=theta_flat,
+        t=t,
+        sigma=sigma,
+        residuals=residuals,
+        freq_mhz=schedule.freq_mhz.copy(),
+        backend_id=schedule.backend_id.copy(),
+        epoch_id=schedule.epoch_id.copy(),
+        F=F,
+        tspan=tspan,
+        n_modes=n_modes,
+        F_dm=F_dm,
+        n_backends=n_backends,
+        theta_global=theta_global.astype(np.float32),
+        theta_wn=theta_wn.astype(np.float32),
     )

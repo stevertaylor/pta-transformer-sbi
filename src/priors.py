@@ -3,6 +3,9 @@
 The parameter dimension and bounds are read from the config dict whose
 keys define the canonical parameter ordering.  Supports Sobol (quasi-random)
 sampling for better coverage of high-dimensional prior spaces.
+
+Also provides FactorizedPrior for models with separate global (red/DM)
+and per-backend (EFAC/EQUAD/ECORR) parameter blocks.
 """
 
 from __future__ import annotations
@@ -73,3 +76,45 @@ class UniformPrior:
     @property
     def bounds_array(self) -> Tuple[np.ndarray, np.ndarray]:
         return self.lo.numpy(), self.hi.numpy()
+
+
+class FactorizedPrior:
+    """Factorized prior: global params + shared per-backend white-noise params.
+
+    Global: (log10_A_red, gamma_red, log10_A_dm, gamma_dm) — 4D
+    Per-backend WN: (EFAC, log10_EQUAD, log10_ECORR) — 3D, same bounds for all backends
+    """
+
+    def __init__(
+        self,
+        global_bounds: dict,
+        wn_bounds: dict,
+        n_backends_max: int = 4,
+    ):
+        self.global_prior = UniformPrior(global_bounds)
+        self.wn_prior = UniformPrior(wn_bounds)
+        self.n_backends_max = n_backends_max
+
+    @property
+    def global_dim(self) -> int:
+        return self.global_prior.dim
+
+    @property
+    def wn_dim(self) -> int:
+        return self.wn_prior.dim
+
+    def sample_global_sobol(self, n: int, seed: int = 42) -> torch.Tensor:
+        """(n, global_dim) Sobol samples for global params."""
+        return self.global_prior.sample_sobol(n, seed=seed)
+
+    def sample_wn_sobol(
+        self, n: int, backend_index: int = 0, seed: int = 42
+    ) -> torch.Tensor:
+        """(n, wn_dim) Sobol samples for one backend's WN params."""
+        return self.wn_prior.sample_sobol(n, seed=seed + 1000 * (backend_index + 1))
+
+    def sample_global(self, n: int, rng=None) -> torch.Tensor:
+        return self.global_prior.sample(n, rng=rng)
+
+    def sample_wn(self, n: int, rng=None) -> torch.Tensor:
+        return self.wn_prior.sample(n, rng=rng)

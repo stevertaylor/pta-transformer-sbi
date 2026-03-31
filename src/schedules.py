@@ -37,6 +37,10 @@ class Schedule:
         return int(self.epoch_id.max()) + 1 if len(self.epoch_id) > 0 else 0
 
     @property
+    def n_backends(self) -> int:
+        return int(self.backend_id.max()) + 1 if len(self.backend_id) > 0 else 0
+
+    @property
     def tspan(self) -> float:
         return float(self.t[-1] - self.t[0]) if len(self.t) > 1 else 0.0
 

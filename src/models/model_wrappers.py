@@ -10,6 +10,7 @@ from .lstm_encoder import LSTMEncoderModel
 from .posterior_flow import PosteriorFlow
 
 N_AUX_FEATURES = 4  # log_n_toa, log_tspan, mean_log_sigma, std_log_sigma
+N_BACKEND_AUX_FEATURES = 3  # log_n_toa_b, mean_log_sigma_b, std_log_sigma_b
 
 
 class NPEModel(nn.Module):
@@ -123,8 +124,18 @@ class NPEModel(nn.Module):
         return log_probs
 
 
-def build_model(model_type: str, cfg: dict) -> NPEModel:
-    """Factory to create NPEModel from config."""
+def build_model(model_type: str, cfg: dict) -> nn.Module:
+    """Factory to create NPEModel or FactorizedNPEModel from config."""
+    mcfg = cfg["model"]
+    factorized = mcfg.get("factorized", False)
+
+    if factorized:
+        return _build_factorized_model(model_type, cfg)
+    return _build_standard_model(model_type, cfg)
+
+
+def _build_standard_model(model_type: str, cfg: dict) -> NPEModel:
+    """Build standard (non-factorized) NPEModel."""
     mcfg = cfg["model"]
     context_dim = mcfg["context_dim"]
     use_aux = mcfg.get("use_aux_features", False)
@@ -173,4 +184,328 @@ def build_model(model_type: str, cfg: dict) -> NPEModel:
 
     return NPEModel(
         encoder, flow, use_aux=use_aux, theta_mean=theta_mean, theta_std=theta_std
+    )
+
+
+# ======================================================================
+# Factorized NPE model: global flow + per-backend white-noise flow
+# ======================================================================
+
+
+class FactorizedNPEModel(nn.Module):
+    """Factorized amortized NPE: separate global and per-backend flows.
+
+    Loss = -log q_global(θ_global|c_global) - mean_b log q_wn(θ_wn_b|c_b)
+
+    This factorizes the 4+3B-dimensional posterior into a 4-D global flow
+    and a shared 3-D per-backend white-noise flow, enabling:
+    - Better EFAC/EQUAD/ECORR calibration (low-D flow, backend-specific context)
+    - Variable number of backends per pulsar (real PTA data ready)
+    """
+
+    def __init__(
+        self,
+        encoder: nn.Module,
+        global_flow: PosteriorFlow,
+        wn_flow: PosteriorFlow,
+        use_aux: bool = False,
+        global_theta_mean: torch.Tensor | None = None,
+        global_theta_std: torch.Tensor | None = None,
+        wn_theta_mean: torch.Tensor | None = None,
+        wn_theta_std: torch.Tensor | None = None,
+        n_backends_max: int = 4,
+        context_dropout: float = 0.0,
+        wn_loss_weight: float = 1.0,
+        wn_context_raw_dim: int | None = None,
+        wn_context_proj_dim: int | None = None,
+    ):
+        super().__init__()
+        self.encoder = encoder
+        self.global_flow = global_flow
+        self.wn_flow = wn_flow
+        self.use_aux = use_aux
+        self.n_backends_max = n_backends_max
+        self.wn_loss_weight = wn_loss_weight
+        self.ctx_dropout = nn.Dropout(context_dropout) if context_dropout > 0 else None
+
+        # Optional bottleneck to compress WN context before the flow
+        if wn_context_proj_dim is not None and wn_context_raw_dim is not None:
+            self.wn_ctx_bottleneck = nn.Sequential(
+                nn.LayerNorm(wn_context_raw_dim),
+                nn.Linear(wn_context_raw_dim, wn_context_proj_dim),
+                nn.GELU(),
+            )
+        else:
+            self.wn_ctx_bottleneck = None
+
+        if global_theta_mean is None:
+            global_theta_mean = torch.zeros(4)
+        if global_theta_std is None:
+            global_theta_std = torch.ones(4)
+        if wn_theta_mean is None:
+            wn_theta_mean = torch.zeros(3)
+        if wn_theta_std is None:
+            wn_theta_std = torch.ones(3)
+
+        self.register_buffer("global_theta_mean", global_theta_mean)
+        self.register_buffer("global_theta_std", global_theta_std)
+        self.register_buffer("wn_theta_mean", wn_theta_mean)
+        self.register_buffer("wn_theta_std", wn_theta_std)
+
+    def _normalize_global(self, theta: torch.Tensor) -> torch.Tensor:
+        return (theta - self.global_theta_mean) / self.global_theta_std
+
+    def _denormalize_global(self, theta_norm: torch.Tensor) -> torch.Tensor:
+        return theta_norm * self.global_theta_std + self.global_theta_mean
+
+    def _normalize_wn(self, theta: torch.Tensor) -> torch.Tensor:
+        return (theta - self.wn_theta_mean) / self.wn_theta_std
+
+    def _denormalize_wn(self, theta_norm: torch.Tensor) -> torch.Tensor:
+        return theta_norm * self.wn_theta_std + self.wn_theta_mean
+
+    def _compute_global_aux(self, batch: dict) -> torch.Tensor:
+        """Global auxiliary features. Returns (B, 4)."""
+        mask = batch["mask"]
+        n_toa = mask.sum(1).float()
+        log_sigma = batch["features"][:, :, 3]
+        mask_f = mask.float()
+        n = mask_f.sum(1).clamp(min=1)
+        mean_ls = (log_sigma * mask_f).sum(1) / n
+        var_ls = ((log_sigma - mean_ls.unsqueeze(1)) ** 2 * mask_f).sum(1) / n
+        std_ls = (var_ls + 1e-8).sqrt()
+        tspan = batch["tspan_yr"]
+        return torch.stack(
+            [
+                torch.log(n_toa.clamp(min=1)),
+                torch.log(tspan.clamp(min=1e-3)),
+                mean_ls,
+                std_ls,
+            ],
+            dim=-1,
+        )
+
+    def _compute_backend_aux(self, batch: dict) -> torch.Tensor:
+        """Per-backend auxiliary features. Returns (B, n_backends_max, 3)."""
+        mask = batch["mask"]
+        backend_id = batch["backend_id"]
+        log_sigma = batch["features"][:, :, 3]
+        B = mask.shape[0]
+
+        aux_list = []
+        for b in range(self.n_backends_max):
+            b_mask = mask & (backend_id == b)
+            b_mask_f = b_mask.float()
+            n_b = b_mask_f.sum(1).clamp(min=1)  # (B,)
+            mean_ls_b = (log_sigma * b_mask_f).sum(1) / n_b
+            var_ls_b = ((log_sigma - mean_ls_b.unsqueeze(1)) ** 2 * b_mask_f).sum(
+                1
+            ) / n_b
+            std_ls_b = (var_ls_b + 1e-8).sqrt()
+            aux_b = torch.stack([torch.log(n_b), mean_ls_b, std_ls_b], dim=-1)
+            aux_list.append(aux_b)
+
+        return torch.stack(aux_list, dim=1)  # (B, Bmax, 3)
+
+    def _get_contexts(self, batch: dict):
+        """Compute global and per-backend flow contexts.
+
+        Returns
+        -------
+        global_ctx  : (B, global_flow_context_dim)
+        wn_ctx      : (B, n_backends_max, wn_flow_context_dim)
+        """
+        global_ctx, backend_ctx = self.encoder.forward_factorized(
+            batch["features"],
+            batch["backend_id"],
+            batch["mask"],
+        )
+        if self.use_aux:
+            global_aux = self._compute_global_aux(batch)
+            global_ctx = torch.cat([global_ctx, global_aux], dim=-1)
+            backend_aux = self._compute_backend_aux(batch)
+            # WN context: [global_ctx broadcast, backend_ctx, backend_aux]
+            global_ctx_exp = global_ctx.unsqueeze(1).expand(-1, self.n_backends_max, -1)
+            wn_ctx = torch.cat([global_ctx_exp, backend_ctx, backend_aux], dim=-1)
+        else:
+            global_ctx_exp = global_ctx.unsqueeze(1).expand(-1, self.n_backends_max, -1)
+            wn_ctx = torch.cat([global_ctx_exp, backend_ctx], dim=-1)
+        # Bottleneck: compress WN context to reduce overfitting
+        if self.wn_ctx_bottleneck is not None:
+            wn_ctx = self.wn_ctx_bottleneck(wn_ctx)
+        return global_ctx, wn_ctx
+
+    def forward(self, batch: dict) -> torch.Tensor:
+        """Compute factorized negative log-prob loss.
+
+        Returns scalar loss = -mean[log q_global] - w * mean[log q_wn (over active backends)].
+        Also stores self._last_global_loss and self._last_wn_loss for logging.
+        """
+        global_ctx, wn_ctx = self._get_contexts(batch)
+
+        # Context dropout for regularization (train only, no-op at eval)
+        if self.ctx_dropout is not None:
+            global_ctx = self.ctx_dropout(global_ctx)
+            wn_ctx = self.ctx_dropout(wn_ctx)
+
+        # Global flow loss
+        theta_global = batch["theta_global"]  # (B, 4)
+        tg_norm = self._normalize_global(theta_global)
+        with torch.autocast(global_ctx.device.type, enabled=False):
+            global_lp = self.global_flow.log_prob(tg_norm.float(), global_ctx.float())
+        global_loss = -global_lp.mean()
+
+        # Per-backend WN flow loss
+        theta_wn = batch["theta_wn"]  # (B, Bmax, 3)
+        backend_active = batch["backend_active"]  # (B, Bmax) bool
+
+        # Flatten active pairs
+        active_mask = backend_active  # (B, Bmax)
+        n_active = active_mask.sum()
+        if n_active > 0:
+            tw_norm = self._normalize_wn(theta_wn)  # (B, Bmax, 3)
+            tw_flat = tw_norm[active_mask]  # (n_active, 3)
+            wn_ctx_flat = wn_ctx[active_mask]  # (n_active, wn_context_dim)
+            with torch.autocast(wn_ctx_flat.device.type, enabled=False):
+                wn_lp = self.wn_flow.log_prob(tw_flat.float(), wn_ctx_flat.float())
+            wn_loss = -wn_lp.mean()
+        else:
+            wn_loss = torch.tensor(0.0, device=global_ctx.device)
+
+        # Cache component losses for logging
+        self._last_global_loss = global_loss.item()
+        self._last_wn_loss = wn_loss.item()
+
+        return global_loss + self.wn_loss_weight * wn_loss
+
+    @torch.no_grad()
+    def sample_posterior(self, batch: dict, n_samples: int = 1000):
+        """Sample from factorized posterior.
+
+        Returns
+        -------
+        global_samples : (B, n_samples, 4)
+        wn_samples : (B, n_backends_max, n_samples, 3)
+        """
+        global_ctx, wn_ctx = self._get_contexts(batch)
+        B = global_ctx.shape[0]
+
+        # Global samples
+        gs_norm = self.global_flow.sample(global_ctx, n_samples)  # (B, S, 4)
+        global_samples = self._denormalize_global(gs_norm)
+
+        # Per-backend WN samples
+        wn_samples_list = []
+        for b in range(self.n_backends_max):
+            ctx_b = wn_ctx[:, b, :]  # (B, wn_ctx_dim)
+            ws_norm = self.wn_flow.sample(ctx_b, n_samples)  # (B, S, 3)
+            wn_samples_list.append(self._denormalize_wn(ws_norm))
+        wn_samples = torch.stack(wn_samples_list, dim=1)  # (B, Bmax, S, 3)
+
+        return global_samples, wn_samples
+
+    @torch.no_grad()
+    def sample_posterior_flat(self, batch: dict, n_samples: int = 1000) -> torch.Tensor:
+        """Sample and concatenate to flat theta for backward compat.
+
+        Returns (B, n_samples, 4 + 3*n_backends_max).
+        """
+        global_samples, wn_samples = self.sample_posterior(batch, n_samples)
+        B, Bmax, S, _ = wn_samples.shape
+        wn_flat = wn_samples.permute(0, 2, 1, 3).reshape(B, S, Bmax * 3)
+        return torch.cat([global_samples, wn_flat], dim=-1)
+
+
+def _build_factorized_model(model_type: str, cfg: dict) -> FactorizedNPEModel:
+    """Build FactorizedNPEModel from config."""
+    mcfg = cfg["model"]
+    context_dim = mcfg["context_dim"]
+    use_aux = mcfg.get("use_aux_features", False)
+    n_backends_max = mcfg.get("n_backends_max", 4)
+
+    # Global flow context dim
+    global_flow_ctx = context_dim + (N_AUX_FEATURES if use_aux else 0)
+    # WN flow context dim: global_ctx + backend_ctx + backend_aux
+    wn_flow_ctx_raw = (
+        global_flow_ctx + context_dim + (N_BACKEND_AUX_FEATURES if use_aux else 0)
+    )
+    wn_ctx_proj_dim = mcfg.get("wn_context_proj_dim", None)
+    wn_flow_ctx = wn_ctx_proj_dim if wn_ctx_proj_dim else wn_flow_ctx_raw
+
+    # Prior bounds for normalization
+    global_cfg = cfg.get("prior", {}).get("global", {})
+    wn_cfg = cfg.get("prior", {}).get("white_noise", {})
+
+    g_names = list(global_cfg.keys())
+    g_lo = torch.tensor([global_cfg[k][0] for k in g_names], dtype=torch.float32)
+    g_hi = torch.tensor([global_cfg[k][1] for k in g_names], dtype=torch.float32)
+    global_theta_mean = (g_lo + g_hi) / 2
+    global_theta_std = (g_hi - g_lo) / 2
+
+    w_names = list(wn_cfg.keys())
+    w_lo = torch.tensor([wn_cfg[k][0] for k in w_names], dtype=torch.float32)
+    w_hi = torch.tensor([wn_cfg[k][1] for k in w_names], dtype=torch.float32)
+    wn_theta_mean = (w_lo + w_hi) / 2
+    wn_theta_std = (w_hi - w_lo) / 2
+
+    # Encoder
+    if model_type == "transformer":
+        encoder = TransformerEncoderModel(
+            n_cont_features=6,
+            d_model=mcfg["d_model"],
+            nhead=mcfg["nhead"],
+            num_layers=mcfg["num_layers"],
+            dim_feedforward=mcfg["dim_feedforward"],
+            dropout=mcfg["dropout"],
+            context_dim=context_dim,
+            use_rope=mcfg.get("use_rope", False),
+            factorized=True,
+            n_backends_max=n_backends_max,
+        )
+    elif model_type == "lstm":
+        encoder = LSTMEncoderModel(
+            n_cont_features=6,
+            d_model=mcfg["d_model"],
+            lstm_hidden=mcfg["lstm_hidden"],
+            lstm_layers=mcfg["lstm_layers"],
+            dropout=mcfg["dropout"],
+            context_dim=context_dim,
+            factorized=True,
+            n_backends_max=n_backends_max,
+        )
+    else:
+        raise ValueError(f"Unknown model type: {model_type}")
+
+    global_flow = PosteriorFlow(
+        theta_dim=len(g_names),
+        context_dim=global_flow_ctx,
+        n_transforms=mcfg.get("global_flow_transforms", 8),
+        hidden_features=mcfg.get("global_flow_hidden", 192),
+        n_hidden_layers=mcfg.get("global_flow_layers", 3),
+        n_bins=mcfg.get("global_flow_bins", 16),
+    )
+
+    wn_flow = PosteriorFlow(
+        theta_dim=len(w_names),
+        context_dim=wn_flow_ctx,
+        n_transforms=mcfg.get("wn_flow_transforms", 6),
+        hidden_features=mcfg.get("wn_flow_hidden", 128),
+        n_hidden_layers=mcfg.get("wn_flow_layers", 2),
+        n_bins=mcfg.get("wn_flow_bins", 8),
+    )
+
+    return FactorizedNPEModel(
+        encoder=encoder,
+        global_flow=global_flow,
+        wn_flow=wn_flow,
+        use_aux=use_aux,
+        global_theta_mean=global_theta_mean,
+        global_theta_std=global_theta_std,
+        wn_theta_mean=wn_theta_mean,
+        wn_theta_std=wn_theta_std,
+        n_backends_max=n_backends_max,
+        context_dropout=mcfg.get("context_dropout", 0.0),
+        wn_loss_weight=mcfg.get("wn_loss_weight", 1.0),
+        wn_context_raw_dim=wn_flow_ctx_raw if wn_ctx_proj_dim else None,
+        wn_context_proj_dim=wn_ctx_proj_dim,
     )

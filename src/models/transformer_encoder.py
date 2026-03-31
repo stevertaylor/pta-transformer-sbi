@@ -175,6 +175,67 @@ class CLSQueryPooling(nn.Module):
         return self.norm(out.squeeze(1))  # (B, d_model)
 
 
+class BackendQueryPooling(nn.Module):
+    """Per-backend cross-attention pooling.
+
+    Uses a shared learned query to attend over only the tokens belonging to
+    each backend, producing one context vector per backend.
+    """
+
+    def __init__(self, d_model: int, nhead: int, dropout: float = 0.0):
+        super().__init__()
+        self.query = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        self.cross_attn = nn.MultiheadAttention(
+            d_model,
+            nhead,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        backend_id: torch.Tensor,
+        n_backends_max: int,
+    ) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        x : (B, L, d_model)
+        mask : (B, L) bool, True = valid
+        backend_id : (B, L) int
+        n_backends_max : int
+
+        Returns
+        -------
+        (B, n_backends_max, d_model) per-backend context vectors
+        """
+        B, L, D = x.shape
+        q = self.query.expand(B, -1, -1)  # (B, 1, d_model)
+
+        contexts = []
+        for b in range(n_backends_max):
+            b_mask = mask & (backend_id == b)  # (B, L)
+            has_tokens = b_mask.any(dim=1)  # (B,)
+
+            # For samples with no tokens from backend b, use full mask
+            # as fallback to avoid NaN in softmax, then zero out.
+            safe_mask = b_mask.clone()
+            empty = ~has_tokens
+            if empty.any():
+                safe_mask[empty] = mask[empty]
+
+            kpm = ~safe_mask
+            out, _ = self.cross_attn(q, x, x, key_padding_mask=kpm)
+            out = self.norm(out.squeeze(1))  # (B, d_model)
+            out = out * has_tokens.float().unsqueeze(-1)
+            contexts.append(out)
+
+        return torch.stack(contexts, dim=1)  # (B, n_backends_max, d_model)
+
+
 # ---------------------------------------------------------------------------
 # Main encoder
 # ---------------------------------------------------------------------------
@@ -203,11 +264,15 @@ class TransformerEncoderModel(nn.Module):
         use_rope: bool = False,
         rope_base: float = 10000.0,
         position_scale: float = 512.0,
+        factorized: bool = False,
+        n_backends_max: int = 4,
     ):
         super().__init__()
         self.d_model = d_model
         self.use_rope = use_rope
         self.position_scale = position_scale
+        self.factorized = factorized
+        self.n_backends_max = n_backends_max
 
         # Token feature MLP (shared)
         in_dim = n_cont_features + backend_embed_dim
@@ -250,6 +315,46 @@ class TransformerEncoderModel(nn.Module):
             nn.Linear(d_model, context_dim),
         )
 
+        # Per-backend pooling and projection (factorized mode)
+        if factorized:
+            self.backend_pool = BackendQueryPooling(d_model, nhead, dropout)
+            self.wn_context_proj = nn.Sequential(
+                nn.LayerNorm(d_model),
+                nn.Linear(d_model, context_dim),
+            )
+
+    def _encode_trunk(
+        self,
+        features: torch.Tensor,
+        backend_id: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run encoder trunk, return (B, L, d_model) sequence output."""
+        B, L, _ = features.shape
+
+        be = self.backend_embed(backend_id)
+        tok_in = torch.cat([features, be], dim=-1)
+        tok_emb = self.token_mlp(tok_in)
+
+        if self.use_rope:
+            positions = features[:, :, 0] * self.position_scale
+            rope_cos, rope_sin = self.rope(positions)
+            pad_mask = ~mask
+            x = tok_emb
+            for block in self.blocks:
+                x = block(x, rope_cos, rope_sin, key_padding_mask=pad_mask)
+            return self.final_norm(x)
+        else:
+            t_emb = self.time_embed(features[:, :, 0], features[:, :, 1])
+            tok_emb = tok_emb + t_emb
+            cls = self.cls_token.expand(B, -1, -1)
+            seq = torch.cat([cls, tok_emb], dim=1)
+            cls_mask = torch.ones(B, 1, dtype=torch.bool, device=mask.device)
+            full_mask = torch.cat([cls_mask, mask], dim=1)
+            out = self.transformer(seq, src_key_padding_mask=~full_mask)
+            # Return just the token outputs (skip CLS position)
+            return out[:, 1:, :]
+
     def forward(
         self,
         features: torch.Tensor,
@@ -267,37 +372,53 @@ class TransformerEncoderModel(nn.Module):
         -------
         context : (B, context_dim)
         """
-        B, L, _ = features.shape
-
-        # Token embedding
-        be = self.backend_embed(backend_id)
-        tok_in = torch.cat([features, be], dim=-1)
-        tok_emb = self.token_mlp(tok_in)
+        x = self._encode_trunk(features, backend_id, mask)
 
         if self.use_rope:
-            # Modern path: RoPE + pre-norm + attention pooling
-            positions = features[:, :, 0] * self.position_scale
-            rope_cos, rope_sin = self.rope(positions)
-            pad_mask = ~mask
-
-            x = tok_emb
-            for block in self.blocks:
-                x = block(x, rope_cos, rope_sin, key_padding_mask=pad_mask)
-            x = self.final_norm(x)
             pooled = self.pool(x, mask)
         else:
-            # Legacy path: additive time embed + CLS + standard transformer
+            # Legacy path: CLS output is at position 0 of trunk output
+            # But _encode_trunk strips CLS for legacy path too,
+            # so we need the CLS token from the transformer output.
+            # Re-run through legacy path directly for backward compat.
+            B, L, _ = features.shape
+            be = self.backend_embed(backend_id)
+            tok_in = torch.cat([features, be], dim=-1)
+            tok_emb = self.token_mlp(tok_in)
             t_emb = self.time_embed(features[:, :, 0], features[:, :, 1])
             tok_emb = tok_emb + t_emb
-
             cls = self.cls_token.expand(B, -1, -1)
             seq = torch.cat([cls, tok_emb], dim=1)
-
             cls_mask = torch.ones(B, 1, dtype=torch.bool, device=mask.device)
             full_mask = torch.cat([cls_mask, mask], dim=1)
-            src_key_padding_mask = ~full_mask
-
-            out = self.transformer(seq, src_key_padding_mask=src_key_padding_mask)
+            out = self.transformer(seq, src_key_padding_mask=~full_mask)
             pooled = out[:, 0, :]
 
         return self.context_proj(pooled)
+
+    def forward_factorized(
+        self,
+        features: torch.Tensor,
+        backend_id: torch.Tensor,
+        mask: torch.Tensor,
+    ):
+        """Return global context and per-backend contexts.
+
+        Returns
+        -------
+        global_ctx  : (B, context_dim)
+        backend_ctx : (B, n_backends_max, context_dim)
+        """
+        x = self._encode_trunk(features, backend_id, mask)
+
+        if self.use_rope:
+            pooled = self.pool(x, mask)
+        else:
+            pooled = (x * mask.unsqueeze(-1).float()).sum(1) / mask.sum(
+                1, keepdim=True
+            ).float().clamp(min=1)
+
+        global_ctx = self.context_proj(pooled)
+        backend_raw = self.backend_pool(x, mask, backend_id, self.n_backends_max)
+        backend_ctx = self.wn_context_proj(backend_raw)
+        return global_ctx, backend_ctx

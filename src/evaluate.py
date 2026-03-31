@@ -36,6 +36,7 @@ from .metrics import (
     point_estimate_error,
 )
 from .plots import plot_posterior_comparison, plot_pp, plot_robustness
+from .importance_sampling import importance_sample, weighted_percentile_rank
 
 
 def parse_args():
@@ -263,6 +264,69 @@ def evaluate_model(
     return result
 
 
+def evaluate_is(
+    model,
+    dataset,
+    cfg,
+    device,
+    n_is_examples: int = 50,
+    n_is_samples: int = 10_000,
+    seed: int = 777,
+):
+    """Run importance-sampling evaluation: ESS and IS-corrected calibration.
+
+    Only evaluated on unmasked data (masking_severity=0).
+    """
+    prior = UniformPrior(cfg["prior"])
+    param_names = list(cfg["prior"].keys())
+    D = len(param_names)
+    jitter = cfg["data"].get("jitter", 1e-20)
+
+    ess_list = []
+    ess_frac_list = []
+    percentiles_is = []
+
+    n_eval = min(n_is_examples, len(dataset))
+
+    for i in tqdm(range(n_eval), desc="IS evaluation", leave=False):
+        item = dataset[i]
+        sim = item["sim"]
+        batch = _make_batch_single(item, device=device)
+
+        result = importance_sample(
+            model, batch, sim, prior, n_samples=n_is_samples, jitter=jitter
+        )
+
+        ess_list.append(result["ess"])
+        ess_frac_list.append(result["ess_fraction"])
+
+        # IS-corrected percentile ranks for P-P calibration
+        true_theta = sim.theta
+        pctls = np.zeros(D)
+        for d in range(D):
+            pctls[d] = weighted_percentile_rank(
+                result["samples"][:, d], result["weights"], true_theta[d]
+            )
+        percentiles_is.append(pctls)
+
+    percentiles_is = np.array(percentiles_is)  # (n_eval, D)
+    ks_is = [ks_statistic(percentiles_is[:, d]) for d in range(D)]
+
+    return {
+        "ess_mean": float(np.mean(ess_list)),
+        "ess_std": float(np.std(ess_list)),
+        "ess_fraction_mean": float(np.mean(ess_frac_list)),
+        "ess_fraction_std": float(np.std(ess_frac_list)),
+        "ess_per_example": [float(e) for e in ess_list],
+        "ess_fraction_per_example": [float(e) for e in ess_frac_list],
+        "ks_is_per_param": {
+            name: float(ks_is[d]) for d, name in enumerate(param_names)
+        },
+        "ks_is_mean": float(np.mean(ks_is)),
+        "percentiles_is": percentiles_is,
+    }
+
+
 def main():
     args = parse_args()
     cfg = load_config(args.config)
@@ -344,6 +408,40 @@ def main():
 
         all_results[name] = model_results
 
+    # --- Importance sampling evaluation (unmasked data only) ---
+    is_cfg = ecfg.get("importance_sampling", {})
+    is_results = {}
+    if is_cfg.get("enabled", False):
+        n_is_examples = is_cfg.get("n_examples", 50)
+        n_is_samples = is_cfg.get("n_samples", 10_000)
+        for name, model in models.items():
+            print(f"\n=== IS evaluation: {name} ===")
+            is_res = evaluate_is(
+                model,
+                test_ds,
+                cfg,
+                device,
+                n_is_examples=n_is_examples,
+                n_is_samples=n_is_samples,
+            )
+            is_results[name] = is_res
+            print(
+                f"  ESS: {is_res['ess_mean']:.1f} ± {is_res['ess_std']:.1f}  "
+                f"({is_res['ess_fraction_mean']:.3f} ± {is_res['ess_fraction_std']:.3f})"
+            )
+            print(f"  IS-corrected KS: {is_res['ks_is_mean']:.4f}")
+
+            # IS-corrected P-P plot
+            model_eval_dir = ensure_dir(os.path.join(eval_dir, name))
+            ks_is_stats = [is_res["ks_is_per_param"].get(p, 0.0) for p in param_names]
+            plot_pp(
+                is_res["percentiles_is"],
+                param_names,
+                os.path.join(model_eval_dir, "pp_is.png"),
+                ks_stats=ks_is_stats,
+                title=f"P-P plot (IS-corrected) – {name}",
+            )
+
     # Robustness plot
     if len(models) == 2:
         names = list(models.keys())
@@ -371,6 +469,21 @@ def main():
                 entry[f"ks_{pn}"] = r["ks_per_param"].get(pn, float("nan"))
                 entry[f"pe_{pn}"] = r["point_error_per_param"].get(pn, float("nan"))
             summary[name][str(sev)] = entry
+
+    # Include IS results in summary
+    for name in is_results:
+        ir = is_results[name]
+        if name not in summary:
+            summary[name] = {}
+        summary[name]["importance_sampling"] = {
+            "ess_mean": ir["ess_mean"],
+            "ess_std": ir["ess_std"],
+            "ess_fraction_mean": ir["ess_fraction_mean"],
+            "ess_fraction_std": ir["ess_fraction_std"],
+            "ks_is_mean": ir["ks_is_mean"],
+            "ks_is_per_param": ir["ks_is_per_param"],
+            "ess_per_example": ir["ess_per_example"],
+        }
 
     with open(os.path.join(eval_dir, "eval_metrics.json"), "w") as f:
         json.dump(summary, f, indent=2)

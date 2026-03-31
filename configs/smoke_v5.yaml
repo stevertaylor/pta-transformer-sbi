@@ -1,0 +1,70 @@
+# Smoke test for v5 factorized architecture – runs fast on CPU
+# Factorized: global 4D flow + per-backend 3D WN flow (shared weights)
+data:
+  train_samples: 2000
+  val_samples: 200
+  test_samples: 200
+  n_fourier_modes: 20
+  n_toa_min: 60
+  n_toa_max: 200
+  tspan_min_yr: 5.0
+  tspan_max_yr: 10.0
+  jitter: 1.0e-20
+
+prior:
+  global:
+    log10_A_red: [-17, -11]
+    gamma_red: [0.5, 6.5]
+    log10_A_dm: [-17, -11]
+    gamma_dm: [0.5, 6.5]
+  white_noise:
+    EFAC: [0.1, 10.0]
+    log10_EQUAD: [-8, -5]
+    log10_ECORR: [-8, -5]
+
+model:
+  factorized: true
+  n_backends_max: 4
+  context_dropout: 0.2
+  wn_loss_weight: 1.0
+  wn_context_proj_dim: 64
+  d_model: 64
+  nhead: 4
+  num_layers: 2
+  dim_feedforward: 128
+  dropout: 0.1
+  context_dim: 32
+  use_rope: true
+  use_aux_features: true
+  lstm_hidden: 64
+  lstm_layers: 2
+  # Global flow (4D)
+  global_flow_transforms: 3
+  global_flow_hidden: 48
+  global_flow_layers: 2
+  global_flow_bins: 8
+  # WN flow (3D, shared across backends)
+  wn_flow_transforms: 3
+  wn_flow_hidden: 48
+  wn_flow_layers: 2
+  wn_flow_bins: 8
+
+training:
+  epochs: 3
+  batch_size: 32
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  grad_clip: 5.0
+  patience: 5
+  seed: 42
+  warmup_fraction: 0.33
+  use_amp: false
+  num_workers: 0
+
+eval:
+  n_grid: 60
+  n_posterior_samples: 500
+  n_test_exact: 20
+  masking_levels: [0.0, 0.3, 0.6]
+
+output_dir: outputs/smoke_v5

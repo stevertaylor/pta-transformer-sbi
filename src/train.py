@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import time
 
 import numpy as np
@@ -18,11 +19,39 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from .utils import load_config, set_seed, get_device, ensure_dir
-from .priors import UniformPrior
+from .priors import UniformPrior, FactorizedPrior
 from .dataset import PulsarDataset
 from .collate import collate_fn
-from .models.model_wrappers import build_model
+from .models.model_wrappers import build_model, FactorizedNPEModel
 from .plots import plot_training_curves
+
+
+class TeeLogger:
+    """Duplicate stdout/stderr to a log file (append mode)."""
+
+    def __init__(self, log_path: str):
+        self._file = open(log_path, "a")
+        self._stdout = sys.stdout
+        self._stderr = sys.stderr
+
+    def __enter__(self):
+        sys.stdout = self
+        sys.stderr = self
+        return self
+
+    def __exit__(self, *exc):
+        sys.stdout = self._stdout
+        sys.stderr = self._stderr
+        self._file.close()
+
+    def write(self, data: str):
+        self._stdout.write(data)
+        self._file.write(data)
+        self._file.flush()
+
+    def flush(self):
+        self._stdout.flush()
+        self._file.flush()
 
 
 def parse_args() -> argparse.Namespace:
@@ -33,14 +62,23 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--device", type=str, default=None, help="Force device (cpu/cuda/mps)"
     )
+    p.add_argument(
+        "--log-file",
+        type=str,
+        default=None,
+        help="Path to log file (appends). Duplicates stdout to file.",
+    )
     return p.parse_args()
 
 
 def train_one_epoch(model, loader, optimizer, device, grad_clip, scaler=None):
     model.train()
     total_loss = 0.0
+    total_global = 0.0
+    total_wn = 0.0
     n = 0
     use_amp = scaler is not None
+    is_factorized = isinstance(model, FactorizedNPEModel)
     for batch in loader:
         batch = {
             k: v.to(device) if isinstance(v, torch.Tensor) else v
@@ -61,16 +99,26 @@ def train_one_epoch(model, loader, optimizer, device, grad_clip, scaler=None):
             if grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
-        total_loss += loss.item() * batch["theta"].shape[0]
-        n += batch["theta"].shape[0]
-    return total_loss / max(n, 1)
+        B = batch["mask"].shape[0]
+        total_loss += loss.item() * B
+        if is_factorized:
+            total_global += model._last_global_loss * B
+            total_wn += model._last_wn_loss * B
+        n += B
+    avg = total_loss / max(n, 1)
+    if is_factorized:
+        return avg, total_global / max(n, 1), total_wn / max(n, 1)
+    return avg
 
 
 @torch.no_grad()
 def validate(model, loader, device, use_amp=False):
     model.eval()
     total_loss = 0.0
+    total_global = 0.0
+    total_wn = 0.0
     n = 0
+    is_factorized = isinstance(model, FactorizedNPEModel)
     for batch in loader:
         batch = {
             k: v.to(device) if isinstance(v, torch.Tensor) else v
@@ -78,14 +126,20 @@ def validate(model, loader, device, use_amp=False):
         }
         with torch.autocast(device.type, enabled=use_amp):
             loss = model(batch)
-        total_loss += loss.item() * batch["theta"].shape[0]
-        n += batch["theta"].shape[0]
-    return total_loss / max(n, 1)
+        B = batch["mask"].shape[0]
+        total_loss += loss.item() * B
+        if is_factorized:
+            total_global += model._last_global_loss * B
+            total_wn += model._last_wn_loss * B
+        n += B
+    avg = total_loss / max(n, 1)
+    if is_factorized:
+        return avg, total_global / max(n, 1), total_wn / max(n, 1)
+    return avg
 
 
-def main():
-    args = parse_args()
-    cfg = load_config(args.config)
+def _run_training(args, cfg):
+    """Core training logic, called inside optional TeeLogger context."""
     tcfg = cfg["training"]
     set_seed(tcfg["seed"])
 
@@ -93,16 +147,32 @@ def main():
     out_dir = os.path.join(out_dir, args.model)
     ensure_dir(out_dir)
 
+    # Banner matching v4d log style
+    version = os.path.basename(cfg.get("output_dir", "unknown"))
+    print(f"=== {version} {args.model.capitalize()} training ===")
+
     if args.device:
         device = torch.device(args.device)
     else:
         device = get_device()
     print(f"Device: {device}")
 
-    prior = UniformPrior(cfg["prior"])
+    prior_cfg = cfg["prior"]
+    factorized = cfg.get("model", {}).get("factorized", False)
+    if factorized:
+        n_backends_max = cfg["model"].get("n_backends_max", 4)
+        prior = FactorizedPrior(
+            prior_cfg["global"],
+            prior_cfg["white_noise"],
+            n_backends_max=n_backends_max,
+        )
+    else:
+        prior = UniformPrior(prior_cfg)
 
     # Datasets
-    use_sobol = cfg.get("data", {}).get("use_sobol", False)
+    data_cfg = cfg.get("data", {})
+    use_sobol = data_cfg.get("use_sobol", False)
+    reseed_per_epoch = data_cfg.get("reseed_per_epoch", False)
     train_ds = PulsarDataset(
         n_samples=cfg["data"]["train_samples"],
         prior=prior,
@@ -111,6 +181,8 @@ def main():
         masking_severity=0.5,
         augment=True,
         use_sobol=use_sobol,
+        factorized=factorized,
+        reseed_per_epoch=reseed_per_epoch,
     )
     val_ds = PulsarDataset(
         n_samples=cfg["data"]["val_samples"],
@@ -119,6 +191,8 @@ def main():
         seed=tcfg["seed"] + 1_000_000,
         masking_severity=0.0,
         augment=False,
+        use_sobol=use_sobol,
+        factorized=factorized,
     )
 
     num_workers = tcfg.get("num_workers", 0)
@@ -148,9 +222,26 @@ def main():
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model: {args.model}, parameters: {n_params:,}")
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=tcfg["lr"], weight_decay=tcfg["weight_decay"]
-    )
+    flow_weight_decay = tcfg.get("flow_weight_decay", None)
+    if isinstance(model, FactorizedNPEModel) and flow_weight_decay is not None:
+        flow_param_ids = {
+            id(p)
+            for submod in [model.global_flow, model.wn_flow]
+            for p in submod.parameters()
+        }
+        encoder_params = [p for p in model.parameters() if id(p) not in flow_param_ids]
+        flow_params = [p for p in model.parameters() if id(p) in flow_param_ids]
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": encoder_params, "weight_decay": tcfg["weight_decay"]},
+                {"params": flow_params, "weight_decay": flow_weight_decay},
+            ],
+            lr=tcfg["lr"],
+        )
+    else:
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=tcfg["lr"], weight_decay=tcfg["weight_decay"]
+        )
 
     # LR scheduler: optional linear warmup + cosine annealing
     warmup_fraction = tcfg.get("warmup_fraction", 0.0)
@@ -188,21 +279,43 @@ def main():
     patience_counter = 0
     train_losses, val_losses = [], []
 
+    is_factorized = isinstance(model, FactorizedNPEModel)
+    train_global_losses, train_wn_losses = [], []
+    val_global_losses, val_wn_losses = [], []
+
     for epoch in range(1, tcfg["epochs"] + 1):
+        train_ds.set_epoch(epoch)
         t0 = time.time()
-        tl = train_one_epoch(
+        train_result = train_one_epoch(
             model, train_loader, optimizer, device, tcfg["grad_clip"], scaler
         )
-        vl = validate(model, val_loader, device, use_amp)
+        val_result = validate(model, val_loader, device, use_amp)
         scheduler.step()
         dt = time.time() - t0
+
+        if is_factorized:
+            tl, tg, tw = train_result
+            vl, vg, vw = val_result
+            train_global_losses.append(tg)
+            train_wn_losses.append(tw)
+            val_global_losses.append(vg)
+            val_wn_losses.append(vw)
+        else:
+            tl = train_result
+            vl = val_result
 
         train_losses.append(tl)
         val_losses.append(vl)
         lr_now = optimizer.param_groups[0]["lr"]
-        print(
-            f"Epoch {epoch:3d}/{tcfg['epochs']}  train={tl:.4f}  val={vl:.4f}  lr={lr_now:.2e}  [{dt:.1f}s]"
-        )
+        if is_factorized:
+            print(
+                f"Epoch {epoch:3d}/{tcfg['epochs']}  train={tl:.4f} (g={tg:.4f} w={tw:.4f})  "
+                f"val={vl:.4f} (g={vg:.4f} w={vw:.4f})  lr={lr_now:.2e}  [{dt:.1f}s]"
+            )
+        else:
+            print(
+                f"Epoch {epoch:3d}/{tcfg['epochs']}  train={tl:.4f}  val={vl:.4f}  lr={lr_now:.2e}  [{dt:.1f}s]"
+            )
 
         if vl < best_val:
             best_val = vl
@@ -241,10 +354,27 @@ def main():
         "train_losses": train_losses,
         "val_losses": val_losses,
     }
+    if is_factorized:
+        metrics["train_global_losses"] = train_global_losses
+        metrics["train_wn_losses"] = train_wn_losses
+        metrics["val_global_losses"] = val_global_losses
+        metrics["val_wn_losses"] = val_wn_losses
     with open(os.path.join(out_dir, "train_metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2)
 
     print(f"Done. Best val loss: {best_val:.4f}. Checkpoint: {ckpt_path}")
+
+
+def main():
+    args = parse_args()
+    cfg = load_config(args.config)
+
+    if args.log_file:
+        ensure_dir(os.path.dirname(args.log_file) or ".")
+        with TeeLogger(args.log_file):
+            _run_training(args, cfg)
+    else:
+        _run_training(args, cfg)
 
 
 if __name__ == "__main__":
