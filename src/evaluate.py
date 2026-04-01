@@ -22,7 +22,7 @@ import torch
 from tqdm import tqdm
 
 from .utils import load_config, set_seed, get_device, ensure_dir
-from .priors import UniformPrior
+from .priors import UniformPrior, FactorizedPrior
 from .dataset import FixedPulsarDataset
 from .collate import collate_fn
 from .models.model_wrappers import build_model
@@ -86,26 +86,45 @@ def _make_batch_single(sim_item, mask_keep=None, device="cpu"):
     backend_id = tokens["backend_id"].unsqueeze(0)
     mask = torch.ones(1, L, dtype=torch.bool)
 
-    return {
-        "theta": sim_item["theta"].unsqueeze(0).to(device),
+    batch = {
         "features": features.to(device),
         "backend_id": backend_id.to(device),
         "mask": mask.to(device),
         "tspan_yr": torch.tensor([tspan_yr], dtype=torch.float32).to(device),
     }
+    # Add theta keys — factorized items use theta_global/theta_wn/backend_active
+    if "theta_global" in sim_item:
+        batch["theta_global"] = sim_item["theta_global"].unsqueeze(0).to(device)
+        batch["theta_wn"] = sim_item["theta_wn"].unsqueeze(0).to(device)
+        batch["backend_active"] = sim_item["backend_active"].unsqueeze(0).to(device)
+    elif "theta" in sim_item:
+        batch["theta"] = sim_item["theta"].unsqueeze(0).to(device)
+    return batch
 
 
 def _build_theta_fixed(sim, prior_param_names):
     """Build a theta_fixed dict from a SimulatedPulsar for conditional evaluation.
 
     Fixes all nuisance parameters (everything except log10_A_red and gamma_red)
-    at their true values.
+    at their true values.  For factorized sims uses theta_global / theta_wn.
     """
     tf = {}
-    for i, name in enumerate(prior_param_names):
-        if name in ("log10_A_red", "gamma_red"):
-            continue
-        tf[name] = float(sim.theta[i])
+    if sim.theta_global is not None:
+        # v5 factorized: global nuisance = log10_A_dm, gamma_dm
+        global_names = ["log10_A_red", "gamma_red", "log10_A_dm", "gamma_dm"]
+        for i, name in enumerate(global_names):
+            if name not in ("log10_A_red", "gamma_red"):
+                tf[name] = float(sim.theta_global[i])
+        # WN nuisance from first active backend
+        if sim.theta_wn is not None and len(sim.theta_wn) > 0:
+            tf["EFAC"] = float(sim.theta_wn[0, 0])
+            tf["log10_EQUAD"] = float(sim.theta_wn[0, 1])
+            tf["log10_ECORR"] = float(sim.theta_wn[0, 2])
+    else:
+        for i, name in enumerate(prior_param_names):
+            if name in ("log10_A_red", "gamma_red"):
+                continue
+            tf[name] = float(sim.theta[i])
     if sim.epoch_id is not None:
         tf["epoch_id"] = sim.epoch_id
     return tf
@@ -123,8 +142,13 @@ def evaluate_model(
     seed=999,
 ):
     """Run full evaluation for one model at one masking level."""
-    prior_bounds = cfg["prior"]
-    param_names = list(prior_bounds.keys())
+    is_factorized = cfg.get("model", {}).get("factorized", False)
+    if is_factorized:
+        prior_bounds = cfg["prior"]["global"]  # flat dict of global bounds only
+        param_names = list(prior_bounds.keys())  # 4 global params
+    else:
+        prior_bounds = cfg["prior"]
+        param_names = list(prior_bounds.keys())
     theta_dim = len(param_names)
     jitter = cfg["data"].get("jitter", 1e-20)
 
@@ -177,14 +201,34 @@ def evaluate_model(
             A_grid = torch.from_numpy(exact["log10_A_grid"].astype(np.float32))
             G_grid = torch.from_numpy(exact["gamma_grid"].astype(np.float32))
             AA, GG = torch.meshgrid(A_grid, G_grid, indexing="ij")
+            n_pts = AA.numel()
 
-            if theta_dim == 2:
-                grid_pts = torch.stack([AA.reshape(-1), GG.reshape(-1)], dim=-1).to(
-                    device
+            if is_factorized:
+                # Build 4-D grid: vary (A_red, gamma_red), fix (A_dm, gamma_dm) at truth
+                theta_g = sim.theta_global  # (4,)
+                grid_full = torch.zeros(n_pts, 4)
+                grid_full[:, 0] = AA.reshape(-1)
+                grid_full[:, 1] = GG.reshape(-1)
+                grid_full[:, 2] = float(theta_g[2])
+                grid_full[:, 3] = float(theta_g[3])
+                grid_pts = grid_full.to(device)
+                with torch.no_grad():
+                    global_ctx, _ = model._get_contexts(batch)
+                    global_ctx_exp = global_ctx.expand(n_pts, -1)
+                    theta_norm = model._normalize_global(grid_pts)
+                    log_probs_norm = model.global_flow.log_prob(
+                        theta_norm.float(), global_ctx_exp.float()
+                    )
+                    log_probs = log_probs_norm - model.global_theta_std.log().sum()
+                log_probs_np = log_probs.cpu().numpy().reshape(n_grid, n_grid).astype(np.float64)
+            elif theta_dim == 2:
+                grid_pts = torch.stack([AA.reshape(-1), GG.reshape(-1)], dim=-1).to(device)
+                log_probs = model.log_prob_on_grid(batch, grid_pts)
+                log_probs_np = (
+                    log_probs.cpu().numpy().reshape(n_grid, n_grid).astype(np.float64)
                 )
             else:
-                # For 7-D model: build full grid by tiling true nuisance values
-                n_pts = AA.numel()
+                # Non-factorized >2D: build full grid by tiling true nuisance values
                 grid_full = torch.zeros(n_pts, theta_dim)
                 grid_full[:, 0] = AA.reshape(-1)
                 grid_full[:, 1] = GG.reshape(-1)
@@ -193,11 +237,10 @@ def evaluate_model(
                         continue
                     grid_full[:, k] = float(sim.theta[k])
                 grid_pts = grid_full.to(device)
-
-            log_probs = model.log_prob_on_grid(batch, grid_pts)
-            log_probs_np = (
-                log_probs.cpu().numpy().reshape(n_grid, n_grid).astype(np.float64)
-            )
+                log_probs = model.log_prob_on_grid(batch, grid_pts)
+                log_probs_np = (
+                    log_probs.cpu().numpy().reshape(n_grid, n_grid).astype(np.float64)
+                )
             dA = float(A_grid[1] - A_grid[0])
             dG = float(G_grid[1] - G_grid[0])
             log_max = np.max(log_probs_np)
@@ -213,11 +256,18 @@ def evaluate_model(
                 exact_posts_out.append(exact)
                 learned_posts_out.append(learned_post)
 
-        # --- Samples for calibration (all D dimensions) ---
-        samples = model.sample_posterior(batch, n_posterior_samples)  # (1, S, D)
-        all_true.append(sim.theta)
-        all_samples.append(samples[0].cpu().numpy())
-        all_means.append(samples[0].cpu().numpy().mean(axis=0))
+        # --- Samples for calibration ---
+        raw = model.sample_posterior(batch, n_posterior_samples)
+        if is_factorized:
+            # Returns (global_samples, wn_samples); use global (B, S, 4)
+            samples_t = raw[0][0]   # (S, 4)
+            true_theta = sim.theta_global
+        else:
+            samples_t = raw[0]      # (S, D)
+            true_theta = sim.theta
+        all_true.append(true_theta)
+        all_samples.append(samples_t.cpu().numpy())
+        all_means.append(samples_t.cpu().numpy().mean(axis=0))
 
     true_arr = np.array(all_true)  # (n_eval, D)
     samples_arr = np.array(all_samples)  # (n_eval, S, D)
@@ -276,9 +326,19 @@ def evaluate_is(
     """Run importance-sampling evaluation: ESS and IS-corrected calibration.
 
     Only evaluated on unmasked data (masking_severity=0).
+    For factorized models, IS is performed on the global posterior with WN
+    fixed at the true values.
     """
-    prior = UniformPrior(cfg["prior"])
-    param_names = list(cfg["prior"].keys())
+    is_factorized = cfg.get("model", {}).get("factorized", False)
+    if is_factorized:
+        prior = FactorizedPrior(
+            cfg["prior"]["global"], cfg["prior"]["white_noise"],
+            n_backends_max=cfg["model"].get("n_backends_max", 4),
+        )
+        param_names = list(cfg["prior"]["global"].keys())
+    else:
+        prior = UniformPrior(cfg["prior"])
+        param_names = list(cfg["prior"].keys())
     D = len(param_names)
     jitter = cfg["data"].get("jitter", 1e-20)
 
@@ -301,7 +361,7 @@ def evaluate_is(
         ess_frac_list.append(result["ess_fraction"])
 
         # IS-corrected percentile ranks for P-P calibration
-        true_theta = sim.theta
+        true_theta = sim.theta_global if is_factorized else sim.theta
         pctls = np.zeros(D)
         for d in range(D):
             pctls[d] = weighted_percentile_rank(
@@ -340,7 +400,16 @@ def main():
     eval_dir = ensure_dir(os.path.join(out_dir, "eval"))
 
     ecfg = cfg["eval"]
-    prior = UniformPrior(cfg["prior"])
+    is_factorized = cfg.get("model", {}).get("factorized", False)
+    if is_factorized:
+        prior = FactorizedPrior(
+            cfg["prior"]["global"], cfg["prior"]["white_noise"],
+            n_backends_max=cfg["model"].get("n_backends_max", 4),
+        )
+        param_names = list(cfg["prior"]["global"].keys())
+    else:
+        prior = UniformPrior(cfg["prior"])
+        param_names = list(cfg["prior"].keys())
 
     # Test dataset
     test_ds = FixedPulsarDataset(
@@ -348,6 +417,7 @@ def main():
         prior=prior,
         data_cfg=cfg["data"],
         seed=cfg["training"]["seed"] + 2_000_000,
+        factorized=is_factorized,
     )
 
     # Load models
@@ -362,7 +432,6 @@ def main():
 
     masking_levels = ecfg.get("masking_levels", [0.0, 0.3, 0.6])
     all_results = {}
-    param_names = list(cfg["prior"].keys())
 
     for name, model in models.items():
         print(f"\n=== Evaluating {name} ===")
@@ -492,11 +561,16 @@ def main():
     print("\nSummary:")
     for name in summary:
         print(f"\n  {name}:")
-        for sev in summary[name]:
-            s = summary[name][sev]
-            print(
-                f"    mask={sev}: H={s['hellinger']:.4f} KS={s['ks_mean']:.4f} PE={s['point_error']:.4f}"
-            )
+        for sev, s in summary[name].items():
+            if sev == "importance_sampling":
+                print(
+                    f"    IS: ESS={s['ess_mean']:.1f} ({s['ess_fraction_mean']:.3f})"
+                    f"  KS_IS={s['ks_is_mean']:.4f}"
+                )
+            else:
+                print(
+                    f"    mask={sev}: H={s['hellinger']:.4f} KS={s['ks_mean']:.4f} PE={s['point_error']:.4f}"
+                )
 
 
 if __name__ == "__main__":

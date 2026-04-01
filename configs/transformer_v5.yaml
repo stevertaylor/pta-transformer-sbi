@@ -16,12 +16,12 @@ data:
 
 prior:
   global:
-    log10_A_red: [-17, -11]
-    gamma_red: [0.5, 6.5]
-    log10_A_dm: [-17, -11]
-    gamma_dm: [0.5, 6.5]
+    log10_A_red: [-18, -11]
+    gamma_red: [1.0, 7.0]
+    log10_A_dm: [-18, -11]
+    gamma_dm: [1.0, 7.0]
   white_noise:
-    EFAC: [0.1, 10.0]
+    EFAC: [0.5, 2.0]
     log10_EQUAD: [-8, -5]
     log10_ECORR: [-8, -5]
 
@@ -68,6 +68,7 @@ training:
   patience: 40
   seed: 42
   warmup_fraction: 0.1
+  ema_alpha: 0.15
   use_amp: true
   num_workers: 4
 
@@ -76,5 +77,9 @@ eval:
   n_posterior_samples: 10000
   n_test_exact: 100
   masking_levels: [0.0, 0.15, 0.3, 0.45, 0.6]
+  importance_sampling:
+    enabled: true
+    n_examples: 50
+    n_samples: 10000
 
 output_dir: outputs/v5

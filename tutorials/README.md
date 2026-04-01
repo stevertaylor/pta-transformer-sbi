@@ -6,11 +6,11 @@ A five-part series walking through the full SBI pipeline for pulsar timing red-n
 
 | # | Notebook | Topics |
 |---|---------|--------|
-| 1 | [Synthetic Data Generation](01_synthetic_data.ipynb) | Observing schedules, priors (IID vs Sobol), Fourier-basis red noise, power-law spectrum (enterprise convention), sensitivity across the prior volume |
-| 2 | [The Data Pipeline](02_data_pipeline.ipynb) | Tokenization (6 features + signed-log transform), masking augmentations (season dropout, end truncation, cadence thinning), `PulsarDataset` / `FixedPulsarDataset`, collation and padding |
-| 3 | [Model Architecture](03_model_architecture.ipynb) | Token MLP, rotary position embeddings (RoPE), pre-norm transformer blocks, CLS-query attention pooling, auxiliary features, neural spline flow (NSF), `NPEModel` wrapper, LSTM comparison |
-| 4 | [Training](04_training.ipynb) | YAML configuration, NPE loss function, learning rate scheduling (warmup + cosine), automatic mixed precision, gradient clipping, early stopping, checkpointing |
-| 5 | [Evaluation](05_evaluation.ipynb) | Exact Bayesian posterior (Woodbury identity), Hellinger distance, P-P calibration plots, KS statistics, point estimate error, robustness under structured masking |
+| 1 | [Synthetic Data Generation](01_synthetic_data.ipynb) | Observing schedules, `FactorizedPrior` (4D global + 3D WN per backend), Fourier-basis red/DM noise, power-law spectrum (enterprise convention), sensitivity across the prior volume |
+| 2 | [The Data Pipeline](02_data_pipeline.ipynb) | Tokenization (6 features + signed-log transform), masking augmentations (season dropout, end truncation, cadence thinning), factorized `PulsarDataset` with epoch reseeding, collation and padding |
+| 3 | [Model Architecture](03_model_architecture.ipynb) | Token MLP, RoPE, pre-norm transformer blocks, `BackendQueryPooling`, WN context bottleneck, context dropout, `FactorizedNPEModel`, dual NSF flows (4D global + 3D WN), LSTM comparison |
+| 4 | [Training](04_training.ipynb) | v5 YAML config, factorized NPE loss, `wn_loss_weight`, LR scheduling (warmup + cosine), per-group weight decay for flows, gradient clipping, epoch reseeding, early stopping |
+| 5 | [Evaluation](05_evaluation.ipynb) | Exact Bayesian posterior (Woodbury identity, red-noise marginal), Hellinger distance, P-P calibration, KS statistics, point estimate error, robustness under structured masking |
 
 ## Prerequisites
 

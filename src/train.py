@@ -275,13 +275,25 @@ def _run_training(args, cfg):
         print("Using automatic mixed precision (AMP)")
 
     # Training loop
+    ema_alpha = tcfg.get("ema_alpha", 0.0)
     best_val = float("inf")
+    best_ema_ckpt = float("inf")
+    best_ema_global = float("inf")
+    best_ema_wn = float("inf")
     patience_counter = 0
+    patience_wn_counter = 0
+    ema_val = ema_global_s = ema_wn_s = None
     train_losses, val_losses = [], []
 
     is_factorized = isinstance(model, FactorizedNPEModel)
     train_global_losses, train_wn_losses = [], []
     val_global_losses, val_wn_losses = [], []
+
+    if ema_alpha > 0:
+        print(f"EMA smoothing: alpha={ema_alpha:.3f} (~{1/ema_alpha:.0f}-epoch window)")
+
+    def _ema(prev, cur):
+        return cur if (prev is None or ema_alpha == 0.0) else ema_alpha * cur + (1.0 - ema_alpha) * prev
 
     for epoch in range(1, tcfg["epochs"] + 1):
         train_ds.set_epoch(epoch)
@@ -306,20 +318,21 @@ def _run_training(args, cfg):
 
         train_losses.append(tl)
         val_losses.append(vl)
-        lr_now = optimizer.param_groups[0]["lr"]
-        if is_factorized:
-            print(
-                f"Epoch {epoch:3d}/{tcfg['epochs']}  train={tl:.4f} (g={tg:.4f} w={tw:.4f})  "
-                f"val={vl:.4f} (g={vg:.4f} w={vw:.4f})  lr={lr_now:.2e}  [{dt:.1f}s]"
-            )
-        else:
-            print(
-                f"Epoch {epoch:3d}/{tcfg['epochs']}  train={tl:.4f}  val={vl:.4f}  lr={lr_now:.2e}  [{dt:.1f}s]"
-            )
 
-        if vl < best_val:
+        # EMA update
+        ema_val = _ema(ema_val, vl)
+        if is_factorized:
+            ema_global_s = _ema(ema_global_s, vg)
+            ema_wn_s = _ema(ema_wn_s, vw)
+            ema_ckpt = ema_global_s + ema_wn_s  # unit-weight composite for checkpoint
+        else:
+            ema_ckpt = ema_val
+
+        # Checkpoint: save when smoothed composite improves
+        improved = ema_ckpt < best_ema_ckpt
+        if improved:
+            best_ema_ckpt = ema_ckpt
             best_val = vl
-            patience_counter = 0
             ckpt_path = os.path.join(out_dir, "best_model.pt")
             torch.save(
                 {
@@ -332,8 +345,43 @@ def _run_training(args, cfg):
                 },
                 ckpt_path,
             )
+
+        # Per-component patience (factorized) or combined (non-factorized)
+        if is_factorized:
+            if ema_global_s < best_ema_global:
+                best_ema_global = ema_global_s
+                patience_counter = 0
+            else:
+                patience_counter += 1
+            if ema_wn_s < best_ema_wn:
+                best_ema_wn = ema_wn_s
+                patience_wn_counter = 0
+            else:
+                patience_wn_counter += 1
         else:
-            patience_counter += 1
+            if improved:
+                patience_counter = 0
+            else:
+                patience_counter += 1
+
+        lr_now = optimizer.param_groups[0]["lr"]
+        if is_factorized:
+            print(
+                f"Epoch {epoch:3d}/{tcfg['epochs']}  train={tl:.4f} (g={tg:.4f} w={tw:.4f})  "
+                f"val={vl:.4f} (g={vg:.4f} w={vw:.4f})  ckpt={ema_ckpt:.4f}  "
+                f"lr={lr_now:.2e}  [{dt:.1f}s]  [pg={patience_counter} pw={patience_wn_counter}]"
+            )
+        else:
+            print(
+                f"Epoch {epoch:3d}/{tcfg['epochs']}  train={tl:.4f}  val={vl:.4f}  lr={lr_now:.2e}  [{dt:.1f}s]"
+            )
+
+        # Early stopping: factorized requires both components to plateau
+        if is_factorized:
+            if patience_counter >= tcfg["patience"] and patience_wn_counter >= tcfg["patience"]:
+                print(f"Early stopping at epoch {epoch} (pg={patience_counter} pw={patience_wn_counter})")
+                break
+        else:
             if patience_counter >= tcfg["patience"]:
                 print(f"Early stopping at epoch {epoch}")
                 break

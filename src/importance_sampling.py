@@ -164,6 +164,10 @@ def importance_sample(
     4. Evaluate log p(x|θ_i)       (exact likelihood — dominant cost)
     5. log w_i = log p(x|θ_i) + log π(θ_i) − log q(θ_i|x)
 
+    For FactorizedNPEModel: IS is performed on the global flow with WN
+    fixed at true values.  The likelihood uses the full 7-D theta (with true
+    first-backend WN appended) to test the global posterior's calibration.
+
     Returns
     -------
     dict with keys:
@@ -178,23 +182,53 @@ def importance_sample(
         log_proposal   (N,)    log q(θ|x)
     """
     device = batch["features"].device
+    is_factorized = hasattr(model, "global_flow")
 
-    # 1. Proposal samples from the flow
-    samples_torch = model.sample_posterior(batch, n_samples)  # (1, N, D)
-    samples_np = samples_torch[0].cpu().numpy().astype(np.float64)
+    if is_factorized:
+        # --- Factorized model: IS on global posterior ---
+        # 1. Global samples
+        global_samples, _ = model.sample_posterior(batch, n_samples)  # (1, S, 4)
+        samples_t = global_samples[0]   # (S, 4)
+        samples_np = samples_t.cpu().numpy().astype(np.float64)
 
-    # 2. Flow log-prob (proposal density)
-    log_q = model.log_prob_on_grid(batch, samples_torch[0].to(device))
-    log_q_np = log_q.cpu().numpy().astype(np.float64)
+        # 2. Global flow log-prob
+        global_ctx, _ = model._get_contexts(batch)
+        global_ctx_exp = global_ctx.expand(n_samples, -1)
+        theta_norm = model._normalize_global(samples_t.to(device))
+        log_probs_norm = model.global_flow.log_prob(theta_norm.float(), global_ctx_exp.float())
+        log_probs = log_probs_norm - model.global_theta_std.log().sum()
+        log_q_np = log_probs.cpu().numpy().astype(np.float64)
 
-    # 3. Prior log-prob
-    log_prior = prior.log_prob(samples_torch[0].cpu()).numpy().astype(np.float64)
+        # 3. Global prior log-prob
+        log_prior_t = prior.global_prior.log_prob(samples_t.cpu())
+        log_prior_np = log_prior_t.numpy().astype(np.float64)
 
-    # 4. Exact log-likelihood (expensive — loops over samples)
-    log_lik = log_likelihood_batch(samples_np, sim, jitter=jitter)
+        # 4. Exact likelihood with true WN params fixed (first backend)
+        wn_true = sim.theta_wn[0] if sim.theta_wn is not None else np.zeros(3)
+        # Build 7-D theta_full by appending true first-backend WN to each global sample
+        wn_tile = np.tile(wn_true, (n_samples, 1))  # (S, 3)
+        theta_full = np.concatenate([samples_np, wn_tile], axis=1)  # (S, 7)
+        log_lik = log_likelihood_batch(theta_full, sim, jitter=jitter)
+
+    else:
+        # --- Non-factorized model ---
+        # 1. Proposal samples from the flow
+        samples_torch = model.sample_posterior(batch, n_samples)  # (1, N, D)
+        samples_t = samples_torch[0]
+        samples_np = samples_t.cpu().numpy().astype(np.float64)
+
+        # 2. Flow log-prob (proposal density)
+        log_q = model.log_prob_on_grid(batch, samples_t.to(device))
+        log_q_np = log_q.cpu().numpy().astype(np.float64)
+
+        # 3. Prior log-prob
+        log_prior_np = prior.log_prob(samples_t.cpu()).numpy().astype(np.float64)
+
+        # 4. Exact log-likelihood
+        log_lik = log_likelihood_batch(samples_np, sim, jitter=jitter)
 
     # 5. Unnormalized log IS weights
-    log_weights = log_lik + log_prior - log_q_np
+    log_weights = log_lik + log_prior_np - log_q_np
 
     # 6. ESS and normalized weights
     valid = np.isfinite(log_weights)
@@ -217,6 +251,6 @@ def importance_sample(
         "ess_fraction": ess / n_samples,
         "n_valid": n_valid,
         "log_likelihood": log_lik,
-        "log_prior": log_prior,
+        "log_prior": log_prior_np,
         "log_proposal": log_q_np,
     }

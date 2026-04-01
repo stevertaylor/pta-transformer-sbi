@@ -12,28 +12,28 @@ We implement a complete toy pipeline for a **single-pulsar red-noise inference**
 
 ## Scientific toy problem
 
-**Infer a 2-D parameter vector** for one pulsar:
+**Infer a 7D+ parameter vector** for one pulsar using **factorized amortized inference**:
 
 ```
-θ = (log10_A_red, gamma_red)
+θ_global = (log10_A_red, gamma_red, log10_A_dm, gamma_dm)   # 4D — one global flow
+θ_wn_b   = (EFAC_b, log10_EQUAD_b, log10_ECORR_b)           # 3D per backend — one shared WN flow
 ```
 
-- `log10_A_red`: log₁₀ of the dimensionless strain amplitude (enterprise convention, prior [−17, −11])
-- `gamma_red`: spectral slope of the red-noise power law (prior [0.5, 6.5])
+The v5 architecture factorizes the posterior into a **global 4D flow** (red + DM noise) and a **shared 3D per-backend white-noise flow** (EFAC/EQUAD/ECORR), enabling both better white-noise calibration and scalability to variable numbers of backends.
 
-The simulator generates irregular, variable-length, gappy observation schedules and produces TOA-level residuals. The model input is **TOA-level tokens** (not a fixed-length handcrafted spectrum), and evaluation includes comparison against an **exact Gaussian posterior** computed on a 2-D grid.
+The simulator generates irregular, variable-length, gappy observation schedules with multiple receiver backends and produces TOA-level residuals. The model input is **TOA-level tokens** (not a fixed-length handcrafted spectrum), evaluated against analytic posteriors marginalized over nuisance parameters.
 
 ### What is simplified vs. a real PTA analysis
 
 | Aspect | This toy | Real PTA |
 |--------|----------|----------|
 | Number of pulsars | 1 | 20–100 |
-| Parameters | 2 (red noise) | Hundreds (DM, timing model, GWB, ...) |
+| Parameters | 7 (4 global + 3 WN) | Hundreds (DM, timing model, GWB, ...) |
 | Timing model | None (residuals given) | Full multi-parameter fit |
 | Units | Physical (seconds, yr⁻¹, strain) | Physical (seconds, Hz, strain) |
-| White noise | Diagonal, known σ | EFAC/EQUAD/ECORR |
+| White noise | EFAC/EQUAD/ECORR per backend | EFAC/EQUAD/ECORR |
 | Likelihood | Exact Gaussian | Same form but much larger |
-| Schedule | Synthetic seasonal | Real observatory logs |
+| Schedule | Synthetic seasonal, multi-backend | Real observatory logs |
 
 ### Units and scaling
 
@@ -57,40 +57,26 @@ pip install numpy scipy matplotlib pyyaml tqdm torch zuko pytest
 ## Quick start — smoke run (CPU, ~30 seconds)
 
 ```bash
-# Train transformer
-python -m src.train --config configs/smoke_v3.yaml --model transformer --device cpu
+# Train transformer (v5 factorized — 4D global + 3D WN flows)
+python -m src.train --config configs/smoke_v5.yaml --model transformer --device cpu
 
-# Train LSTM
-python -m src.train --config configs/smoke_v3.yaml --model lstm --device cpu
-
-# Evaluate both (comparison plots, metrics, robustness)
-python -m src.evaluate --config configs/smoke_v3.yaml \
-    --checkpoint outputs/smoke_v3/transformer/best_model.pt \
-    --baseline-checkpoint outputs/smoke_v3/lstm/best_model.pt \
-    --device cpu
-
-# Demo: single-example posterior comparison
-python -m src.demo_inference \
-    --checkpoint outputs/smoke_v3/transformer/best_model.pt \
-    --output outputs/smoke_v3/demo_inference.png \
-    --device cpu
+# Train LSTM baseline
+python -m src.train --config configs/smoke_v5.yaml --model lstm --device cpu
 ```
 
-> Legacy configs (`smoke.yaml`, `transformer.yaml`, `lstm.yaml`) still exist for reproducibility but use the older arbitrary-units parameterisation. The `*_v3.yaml` configs use physical PTA/enterprise units and the improved architecture (RoPE, attention pooling, aux features, deeper flow).
+> Legacy configs (`smoke_v3.yaml`, `transformer_v3.yaml`, etc.) remain for reproducibility but use the older monolithic NPE architecture.
 
 ## Full run (GPU recommended)
 
 ```bash
-# Train transformer (v3 config — RoPE, attention pooling, aux features)
-python -m src.train --config configs/transformer_v3.yaml --model transformer
+# Train transformer (v5 — factorized amortized inference)
+python -m src.train \
+    --config configs/transformer_v5.yaml \
+    --model transformer \
+    --log-file outputs/v5_train.log
 
-# Train LSTM (v3 config — same data/flow/training, LSTM encoder)
-python -m src.train --config configs/lstm_v3.yaml --model lstm
-
-# Evaluate (comparison plots, metrics, robustness)
-python -m src.evaluate --config configs/transformer_v3.yaml \
-    --checkpoint outputs/v3/transformer/best_model.pt \
-    --baseline-checkpoint outputs/v3/lstm/best_model.pt
+# Train LSTM baseline (same factorized config)
+python -m src.train --config configs/lstm_v5.yaml --model lstm
 ```
 
 ## Running tests
@@ -103,35 +89,36 @@ python -m pytest tests/ -v
 
 ```
 ├── configs/
-│   ├── smoke_v3.yaml       # Fast CPU smoke test (physical units, v3 arch)
-│   ├── transformer_v3.yaml # Full transformer config (v3)
-│   ├── lstm_v3.yaml        # Full LSTM config (v3)
-│   ├── smoke.yaml          # Legacy smoke test (arbitrary units)
-│   ├── transformer.yaml    # Legacy transformer config
-│   └── lstm.yaml           # Legacy LSTM config
+│   ├── smoke_v5.yaml       # Fast CPU smoke test (v5 factorized)
+│   ├── transformer_v5.yaml # Full transformer config (v5 factorized)
+│   ├── lstm_v5.yaml        # Full LSTM config (v5 factorized)
+│   ├── smoke_v3.yaml       # Legacy smoke test (v3 monolithic)
+│   ├── transformer_v3.yaml # Legacy transformer config (v3)
+│   └── lstm_v3.yaml        # Legacy LSTM config (v3)
 ├── src/
-│   ├── priors.py           # Uniform prior over θ
+│   ├── priors.py           # UniformPrior + FactorizedPrior (global + WN blocks)
 │   ├── schedules.py        # Synthetic observing schedule generator
-│   ├── simulator.py        # Fourier-basis red-noise simulator
+│   ├── simulator.py        # Fourier-basis red/DM-noise simulator (standard + factorized)
 │   ├── exact_posterior.py  # Exact Gaussian posterior on 2-D grid
 │   ├── masking.py          # Structured masking augmentations
-│   ├── dataset.py          # PyTorch datasets (on-the-fly + fixed)
+│   ├── dataset.py          # PyTorch datasets (on-the-fly + fixed; epoch reseeding)
 │   ├── collate.py          # Padding collate function
 │   ├── metrics.py          # Hellinger, calibration, point-error
 │   ├── plots.py            # All plotting helpers
 │   ├── utils.py            # Config loading, seeding, device
-│   ├── train.py            # Training script (CLI)
+│   ├── train.py            # Training script (CLI; per-group weight decay)
 │   ├── evaluate.py         # Evaluation script (CLI)
 │   ├── demo_inference.py   # Single-example demo (CLI)
 │   └── models/
 │       ├── tokenization.py        # TOA → token features
-│       ├── transformer_encoder.py # Transformer + CLS + time embed
+│       ├── transformer_encoder.py # Transformer + RoPE + BackendQueryPooling
 │       ├── lstm_encoder.py        # LSTM baseline encoder
 │       ├── posterior_flow.py      # Zuko NSF conditional flow
-│       └── model_wrappers.py      # NPEModel = encoder + flow
+│       └── model_wrappers.py      # NPEModel + FactorizedNPEModel + build_model
 ├── tests/
 │   ├── test_simulator.py
 │   ├── test_exact_posterior.py
+│   ├── test_factorized.py
 │   ├── test_models.py
 │   └── test_smoke_train_step.py
 ├── outputs/                # Generated checkpoints, plots, metrics
@@ -214,7 +201,7 @@ flowchart TB
     subgraph POOL["Sequence → Vector"]
         direction TB
         FLN["Final LayerNorm(256)"]
-        AP["Attention Pooling\nLinear(256→1) → masked softmax\n→ weighted sum"]
+        AP["CLS-Query Pooling\nLearned query + 8-head\ncross-attention → (B, 256)"]
         CP["Context Projection\nLayerNorm(256) → Linear(256→128)"]
         FLN --> AP --> CP
     end
@@ -231,20 +218,35 @@ flowchart TB
 
     subgraph THETANORM["θ Normalization"]
         direction TB
-        TN["θ_norm = (θ − μ) / s\nμ = −14, 3.5  s = 3, 3\nmaps prior → −1, 1"]
+        TN["θ_norm = (θ − μ) / s\nμ = −14.5, 4, −14.5, 4\ns = 3.5, 3, 3.5, 3\nmaps prior → ≈ [−1, 1]"]
     end
 
-    subgraph FLOW["Neural Spline Flow (Zuko NSF)"]
+    subgraph GLOBALFLOW["Global NSF (4D: A_red, γ_red, A_dm, γ_dm)"]
         direction TB
-        F1["10 Coupling Transforms\nEach: 3-layer MLP (256 units)\n16-bin rational-quadratic splines"]
-        F2["Base Distribution\nN(0, I₂)"]
-        F1 --- F2
+        GF1["8 Coupling Transforms\n3-layer MLP (192 units)\n16-bin splines"]
+        GF2["Base N(0, I₄)"]
+        GF1 --- GF2
+    end
+
+    subgraph WNPOOL["BackendQueryPooling"]
+        BQP["Learned query cross-attends\nover backend-b tokens only\n→ (B, 4, 128) per-backend ctx"]
+    end
+
+    subgraph WNBOTTLENECK["WN Context Bottleneck"]
+        WNB["[global_ctx ∥ backend_ctx ∥ backend_aux]\n263-D → LayerNorm → Linear → GELU → 32-D"]
+    end
+
+    subgraph WNFLOW["WN NSF — shared (3D: EFAC, EQUAD, ECORR)"]
+        direction TB
+        WF1["6 Coupling Transforms\n2-layer MLP (128 units)\n8-bin splines\n(applied per active backend)"]
+        WF2["Base N(0, I₃)"]
+        WF1 --- WF2
     end
 
     subgraph OUT["Output"]
         direction LR
-        O1["log q(θ|c)\nTraining loss"]
-        O2["θ samples\n(denormalized)\nPosterior inference"]
+        O1["log q_global(θ_g|c_g) + w·log q_wn(θ_wn|c_b)\nTraining loss"]
+        O2["Global + per-backend samples\n(denormalized)\nPosterior inference"]
     end
 
     INPUT --> TOKEN
@@ -260,9 +262,16 @@ flowchart TB
     CP -->|"(B, 128)"| CATCTX
     AUX -->|"(B, 4)"| CATCTX
 
-    CATCTX -->|"(B, 132)"| FLOW
-    THETANORM -->|"θ_norm (B, 2)"| FLOW
-    FLOW --> OUT
+    CATCTX -->|"(B, 132)"| GLOBALFLOW
+    THETANORM -->|"θ_global_norm (B, 4)"| GLOBALFLOW
+
+    RES2 -->|"(B, L, 256)"| WNPOOL
+    WNPOOL --> WNBOTTLENECK
+    CATCTX -->|broadcast| WNBOTTLENECK
+    WNBOTTLENECK -->|"(B, 4, 32)"| WNFLOW
+
+    GLOBALFLOW --> OUT
+    WNFLOW --> OUT
 
     style INPUT fill:#e8f4fd,stroke:#2980b9
     style TOKEN fill:#fef9e7,stroke:#f39c12
@@ -271,7 +280,10 @@ flowchart TB
     style XFORMER fill:#f5eef8,stroke:#8e44ad
     style POOL fill:#eafaf1,stroke:#27ae60
     style AUX fill:#fbeee6,stroke:#e67e22
-    style FLOW fill:#eaf2f8,stroke:#2471a3
+    style GLOBALFLOW fill:#eaf2f8,stroke:#2471a3
+    style WNPOOL fill:#eafaf1,stroke:#27ae60
+    style WNBOTTLENECK fill:#fef9e7,stroke:#f39c12
+    style WNFLOW fill:#d5e8d4,stroke:#27ae60
     style THETANORM fill:#fef9e7,stroke:#f39c12
     style OUT fill:#e8f8f5,stroke:#1abc9c
 ```
@@ -279,13 +291,26 @@ flowchart TB
 ## Key design choices
 
 - **TOA-level tokens**: Each observation is a token with 6 continuous features (normalized time, gap, residual/σ, log σ, raw residual, frequency) plus an embedded backend ID. No fixed-length spectrum.
-- **Rotary Position Embeddings (RoPE)**: Injects timing information directly into the attention mechanism via rotation of query/key pairs — critical for irregularly-sampled data. (Legacy path uses additive TimeEmbedding + CLS token.)
-- **Attention pooling**: A learnable attention-weighted mean replaces the CLS token for aggregating the sequence into a fixed-size context vector. (Legacy path uses CLS token output.)
+- **Rotary Position Embeddings (RoPE)**: Injects timing information directly into the attention mechanism via rotation of query/key pairs — critical for irregularly-sampled data.
+- **Factorized amortized inference (v5)**: The 7D posterior is factorized into a 4D global flow (red + DM noise) and a shared 3D per-backend white-noise flow (EFAC/EQUAD/ECORR). This improves WN calibration and supports variable backend counts.
+- **BackendQueryPooling**: Per-backend context vectors are produced by cross-attending over only the tokens from each backend, providing backend-specific conditioning for the WN flow.
+- **WN context bottleneck**: Per-backend WN context (global ctx + backend ctx + aux) is compressed through LayerNorm → Linear → GELU before the WN flow, limiting information capacity to prevent overfitting.
+- **Context dropout (0.2)**: Applied to both global and WN contexts during training for additional regularization.
+- **Epoch reseeding**: Training dataset reseeds its RNG each epoch, so each epoch draws fresh (θ, schedule, noise) triples — preventing the flow from memorizing fixed training pairs.
+- **Per-group weight decay**: Flow parameters use 4× higher weight decay (2×10⁻³) than the encoder (5×10⁻⁴), since flows are more prone to overfitting than transformers.
 - **Pre-norm transformer blocks**: LayerNorm before (not after) attention and FFN, improving training stability with deeper models.
-- **Auxiliary features**: 4 summary statistics (log N_TOA, log T_span, mean/std of log σ) are concatenated to the context vector before the flow.
-- **Shared posterior head**: Both encoders feed into the same Zuko NSF conditional normalizing flow, ensuring a fair comparison.
-- **Theta normalisation**: Prior bounds are used to map θ to approximately [−1, 1] before the flow, keeping values within the NSF spline domain.
+- **Auxiliary features**: 4 global summary statistics (log N_TOA, log T_span, mean/std of log σ) plus 3 per-backend statistics (log N_TOA_b, mean/std log σ_b) are concatenated before the respective flows.
 - **Structured masking augmentations**: Season dropout, end truncation, cadence thinning — not just iid random dropout.
+
+## Version history
+
+| Version | Architecture | Key changes |
+|---------|-------------|-------------|
+| v1 | 2D NPE, arbitrary units | Initial prototype |
+| v2 | 2D NPE, physical units | Enterprise/PTA convention |
+| v3 | 2D NPE + RoPE + aux features | Rotary embeddings, attention pooling, deeper flow |
+| v4 | 2D NPE, improved training | Longer runs, better regularization |
+| **v5** | **Factorized NPE (4D global + 3D WN)** | **Factorized amortization, epoch reseeding, per-group weight decay, flow-stability training** |
 
 ## Tutorials
 
@@ -295,8 +320,8 @@ The `tutorials/` folder contains a five-part deep-dive series:
 
 | # | Notebook | Topics |
 |---|---------|--------|
-| 1 | [Synthetic Data Generation](tutorials/01_synthetic_data.ipynb) | Schedules, priors, Fourier red noise, power-law spectrum, sensitivity |
-| 2 | [Data Pipeline](tutorials/02_data_pipeline.ipynb) | Tokenization, signed-log transform, masking augmentations, datasets, collation |
-| 3 | [Model Architecture](tutorials/03_model_architecture.ipynb) | Token embedding, RoPE, pre-norm blocks, attention pooling, NSF flow, LSTM comparison |
-| 4 | [Training](tutorials/04_training.ipynb) | Config system, NPE loss, LR scheduling, AMP, early stopping |
-| 5 | [Evaluation](tutorials/05_evaluation.ipynb) | Exact posteriors, Hellinger distance, P-P calibration, robustness |
+| 1 | [Synthetic Data Generation](tutorials/01_synthetic_data.ipynb) | Schedules, FactorizedPrior (4D global + 3D WN), Fourier red/DM noise, power-law spectrum |
+| 2 | [Data Pipeline](tutorials/02_data_pipeline.ipynb) | Tokenization, masking augmentations, factorized PulsarDataset, epoch reseeding, collation |
+| 3 | [Model Architecture](tutorials/03_model_architecture.ipynb) | RoPE, BackendQueryPooling, WN bottleneck, context dropout, FactorizedNPEModel, dual NSF flows |
+| 4 | [Training](tutorials/04_training.ipynb) | v5 config, factorized NPE loss, LR scheduling, per-group weight decay, AMP, early stopping |
+| 5 | [Evaluation](tutorials/05_evaluation.ipynb) | Exact posteriors (red-noise marginal), Hellinger distance, P-P calibration, robustness |
