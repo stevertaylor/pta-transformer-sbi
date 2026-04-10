@@ -1,6 +1,16 @@
-# v5 config – factorized amortization for RTX 4090
-# Separate global 4D flow + shared per-backend 3D WN flow
-# Addresses EFAC miscalibration and enables variable backend counts
+# v6b config – fix v6 overfitting while keeping global flow capacity
+#
+# v6 lesson: removing ALL regularization + oversizing WN flow caused
+# catastrophic overfitting (train-val gap 8.66 nats by epoch 9).
+#
+# Changes from v6:
+#   1. Revert WN flow to v5 size (6×128×2×8) — WN was never the bottleneck
+#   2. Restore encoder dropout to 0.1 — 6-layer transformer needs it
+#   3. Keep large global flow (10×256×3×16) — this IS the fix
+#   4. Keep no bottlenecks, no context dropout, no masking, Sobol on
+#
+# Net effect vs v5: only the global flow capacity and bottleneck removal
+# change. Everything else is v5-baseline or minimal delta.
 data:
   train_samples: 500000
   val_samples: 50000
@@ -11,12 +21,10 @@ data:
   tspan_min_yr: 5.0
   tspan_max_yr: 15.0
   jitter: 1.0e-20
-  use_sobol: false
+  use_sobol: true
   reseed_per_epoch: true
-  # Fix 4: align train/val masking distribution to reduce encoder
-  # distribution-shift between training and evaluation.
-  train_masking_severity: 0.5
-  val_masking_severity: 0.15
+  train_masking_severity: 0.0
+  val_masking_severity: 0.0
 
 prior:
   global:
@@ -32,12 +40,11 @@ prior:
 model:
   factorized: true
   n_backends_max: 4
-  context_dropout: 0.2
-  wn_loss_weight: 0.3
-  global_context_proj_dim: 48
-  wn_context_proj_dim: 32
+  context_dropout: 0.0
+  wn_loss_weight: 1.0
+  # No context bottlenecks
 
-  # Transformer encoder
+  # Transformer encoder (same as v5)
   d_model: 256
   nhead: 8
   num_layers: 6
@@ -51,13 +58,13 @@ model:
   lstm_hidden: 256
   lstm_layers: 3
 
-  # Global flow (4D: A_red, gamma_red, A_dm, gamma_dm)
-  global_flow_transforms: 6
-  global_flow_hidden: 128
-  global_flow_layers: 2
-  global_flow_bins: 8
+  # Global flow (4D) – restored to v4c-level capacity
+  global_flow_transforms: 10
+  global_flow_hidden: 256
+  global_flow_layers: 3
+  global_flow_bins: 16
 
-  # WN flow (3D: EFAC, EQUAD, ECORR — shared across backends)
+  # WN flow (3D) – kept at v5 size, it was already good
   wn_flow_transforms: 6
   wn_flow_hidden: 128
   wn_flow_layers: 2
@@ -87,4 +94,4 @@ eval:
     n_examples: 50
     n_samples: 10000
 
-output_dir: outputs/v5
+output_dir: outputs/v6b

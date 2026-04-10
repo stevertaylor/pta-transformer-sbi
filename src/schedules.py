@@ -51,6 +51,7 @@ def generate_schedule(
     tspan_max_yr: float = 15.0,
     n_toa_min: int = 80,
     n_toa_max: int = 400,
+    n_backends_fixed: Optional[int] = None,
 ) -> Schedule:
     """Create one random observing schedule with multi-frequency epochs.
 
@@ -100,7 +101,7 @@ def generate_schedule(
         epoch_times = epoch_times[idx]
 
     # ---- generate TOAs per epoch ----
-    n_backends = rng.integers(1, 4)
+    n_backends = n_backends_fixed if n_backends_fixed is not None else rng.integers(1, 4)
     freq_choices = np.array([820.0, 1400.0, 2300.0])
     log_sig_low, log_sig_high = -7.0, -5.0  # seconds (100 ns to 10 μs)
 

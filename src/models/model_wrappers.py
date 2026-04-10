@@ -8,6 +8,7 @@ import torch.nn as nn
 from .transformer_encoder import TransformerEncoderModel
 from .lstm_encoder import LSTMEncoderModel
 from .posterior_flow import PosteriorFlow
+from .tokenization import N_CONTINUOUS_FEATURES
 
 N_AUX_FEATURES = 4  # log_n_toa, log_tspan, mean_log_sigma, std_log_sigma
 N_BACKEND_AUX_FEATURES = 3  # log_n_toa_b, mean_log_sigma_b, std_log_sigma_b
@@ -152,7 +153,7 @@ def _build_standard_model(model_type: str, cfg: dict) -> NPEModel:
 
     if model_type == "transformer":
         encoder = TransformerEncoderModel(
-            n_cont_features=6,
+            n_cont_features=N_CONTINUOUS_FEATURES,
             d_model=mcfg["d_model"],
             nhead=mcfg["nhead"],
             num_layers=mcfg["num_layers"],
@@ -163,7 +164,7 @@ def _build_standard_model(model_type: str, cfg: dict) -> NPEModel:
         )
     elif model_type == "lstm":
         encoder = LSTMEncoderModel(
-            n_cont_features=6,
+            n_cont_features=N_CONTINUOUS_FEATURES,
             d_model=mcfg["d_model"],
             lstm_hidden=mcfg["lstm_hidden"],
             lstm_layers=mcfg["lstm_layers"],
@@ -216,6 +217,8 @@ class FactorizedNPEModel(nn.Module):
         n_backends_max: int = 4,
         context_dropout: float = 0.0,
         wn_loss_weight: float = 1.0,
+        global_context_raw_dim: int | None = None,
+        global_context_proj_dim: int | None = None,
         wn_context_raw_dim: int | None = None,
         wn_context_proj_dim: int | None = None,
     ):
@@ -227,6 +230,16 @@ class FactorizedNPEModel(nn.Module):
         self.n_backends_max = n_backends_max
         self.wn_loss_weight = wn_loss_weight
         self.ctx_dropout = nn.Dropout(context_dropout) if context_dropout > 0 else None
+
+        # Optional bottleneck to compress global context before the flow
+        if global_context_proj_dim is not None and global_context_raw_dim is not None:
+            self.global_ctx_bottleneck = nn.Sequential(
+                nn.LayerNorm(global_context_raw_dim),
+                nn.Linear(global_context_raw_dim, global_context_proj_dim),
+                nn.GELU(),
+            )
+        else:
+            self.global_ctx_bottleneck = None
 
         # Optional bottleneck to compress WN context before the flow
         if wn_context_proj_dim is not None and wn_context_raw_dim is not None:
@@ -330,6 +343,9 @@ class FactorizedNPEModel(nn.Module):
         else:
             global_ctx_exp = global_ctx.unsqueeze(1).expand(-1, self.n_backends_max, -1)
             wn_ctx = torch.cat([global_ctx_exp, backend_ctx], dim=-1)
+        # Bottleneck: compress global context to reduce overfitting
+        if self.global_ctx_bottleneck is not None:
+            global_ctx = self.global_ctx_bottleneck(global_ctx)
         # Bottleneck: compress WN context to reduce overfitting
         if self.wn_ctx_bottleneck is not None:
             wn_ctx = self.wn_ctx_bottleneck(wn_ctx)
@@ -424,10 +440,12 @@ def _build_factorized_model(model_type: str, cfg: dict) -> FactorizedNPEModel:
     n_backends_max = mcfg.get("n_backends_max", 4)
 
     # Global flow context dim
-    global_flow_ctx = context_dim + (N_AUX_FEATURES if use_aux else 0)
+    global_flow_ctx_raw = context_dim + (N_AUX_FEATURES if use_aux else 0)
+    global_ctx_proj_dim = mcfg.get("global_context_proj_dim", None)
+    global_flow_ctx = global_ctx_proj_dim if global_ctx_proj_dim else global_flow_ctx_raw
     # WN flow context dim: global_ctx + backend_ctx + backend_aux
     wn_flow_ctx_raw = (
-        global_flow_ctx + context_dim + (N_BACKEND_AUX_FEATURES if use_aux else 0)
+        global_flow_ctx_raw + context_dim + (N_BACKEND_AUX_FEATURES if use_aux else 0)
     )
     wn_ctx_proj_dim = mcfg.get("wn_context_proj_dim", None)
     wn_flow_ctx = wn_ctx_proj_dim if wn_ctx_proj_dim else wn_flow_ctx_raw
@@ -451,7 +469,7 @@ def _build_factorized_model(model_type: str, cfg: dict) -> FactorizedNPEModel:
     # Encoder
     if model_type == "transformer":
         encoder = TransformerEncoderModel(
-            n_cont_features=6,
+            n_cont_features=N_CONTINUOUS_FEATURES,
             d_model=mcfg["d_model"],
             nhead=mcfg["nhead"],
             num_layers=mcfg["num_layers"],
@@ -464,7 +482,7 @@ def _build_factorized_model(model_type: str, cfg: dict) -> FactorizedNPEModel:
         )
     elif model_type == "lstm":
         encoder = LSTMEncoderModel(
-            n_cont_features=6,
+            n_cont_features=N_CONTINUOUS_FEATURES,
             d_model=mcfg["d_model"],
             lstm_hidden=mcfg["lstm_hidden"],
             lstm_layers=mcfg["lstm_layers"],
@@ -506,6 +524,8 @@ def _build_factorized_model(model_type: str, cfg: dict) -> FactorizedNPEModel:
         n_backends_max=n_backends_max,
         context_dropout=mcfg.get("context_dropout", 0.0),
         wn_loss_weight=mcfg.get("wn_loss_weight", 1.0),
+        global_context_raw_dim=global_flow_ctx_raw if global_ctx_proj_dim else None,
+        global_context_proj_dim=global_ctx_proj_dim,
         wn_context_raw_dim=wn_flow_ctx_raw if wn_ctx_proj_dim else None,
         wn_context_proj_dim=wn_ctx_proj_dim,
     )

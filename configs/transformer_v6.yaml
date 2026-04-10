@@ -1,0 +1,101 @@
+# v6 config – Phase 1 remediation: fix architecture, keep factorization
+#
+# Root-cause fix for v4c→v5 regression.  Changes from v5:
+#   1. Remove context bottlenecks (global_context_proj_dim / wn_context_proj_dim)
+#   2. Increase global flow: 10×256×3×16 (match v4c capacity)
+#   3. Increase WN flow: 8×192×2×12
+#   4. wn_loss_weight: 1.0 (full gradient to both heads)
+#   5. context_dropout: 0.0 (model is underfitting, not overfitting)
+#   6. use_sobol: true (better prior coverage)
+#   7. No training masking (remove distribution shift)
+#   8. Encoder dropout: 0.05 (revert v5's 0.1)
+#
+# Everything else (priors, encoder size, training schedule) kept from v5
+# so any improvement is attributable to architecture, not confounders.
+data:
+  train_samples: 500000
+  val_samples: 50000
+  test_samples: 5000
+  n_fourier_modes: 30
+  n_toa_min: 80
+  n_toa_max: 400
+  tspan_min_yr: 5.0
+  tspan_max_yr: 15.0
+  jitter: 1.0e-20
+  use_sobol: true
+  reseed_per_epoch: true
+  train_masking_severity: 0.0
+  val_masking_severity: 0.0
+
+prior:
+  global:
+    log10_A_red: [-18, -11]
+    gamma_red: [1.0, 7.0]
+    log10_A_dm: [-18, -11]
+    gamma_dm: [1.0, 7.0]
+  white_noise:
+    EFAC: [0.5, 2.0]
+    log10_EQUAD: [-8, -5]
+    log10_ECORR: [-8, -5]
+
+model:
+  factorized: true
+  n_backends_max: 4
+  context_dropout: 0.0
+  wn_loss_weight: 1.0
+  # No context bottlenecks — removed to fix underfitting
+  # global_context_proj_dim and wn_context_proj_dim intentionally omitted
+
+  # Transformer encoder (same as v5)
+  d_model: 256
+  nhead: 8
+  num_layers: 6
+  dim_feedforward: 1024
+  dropout: 0.05
+  context_dim: 128
+  use_rope: true
+  use_aux_features: true
+
+  # LSTM (shared config key, unused for transformer)
+  lstm_hidden: 256
+  lstm_layers: 3
+
+  # Global flow (4D: A_red, gamma_red, A_dm, gamma_dm)
+  # Restored to v4c-level capacity: 10×256×3×16
+  global_flow_transforms: 10
+  global_flow_hidden: 256
+  global_flow_layers: 3
+  global_flow_bins: 16
+
+  # WN flow (3D: EFAC, EQUAD, ECORR — shared across backends)
+  # Increased from v5's 6×128×2×8 to 8×192×2×12
+  wn_flow_transforms: 8
+  wn_flow_hidden: 192
+  wn_flow_layers: 2
+  wn_flow_bins: 12
+
+training:
+  epochs: 200
+  batch_size: 256
+  lr: 3.0e-4
+  weight_decay: 5.0e-4
+  flow_weight_decay: 2.0e-3
+  grad_clip: 1.0
+  patience: 40
+  seed: 42
+  warmup_fraction: 0.1
+  ema_alpha: 0.15
+  use_amp: true
+  num_workers: 4
+
+eval:
+  n_grid: 200
+  n_posterior_samples: 10000
+  n_test_exact: 100
+  masking_levels: [0.0, 0.15, 0.3, 0.45, 0.6]
+  importance_sampling:
+    enabled: true
+    n_examples: 50
+    n_samples: 10000
+
+output_dir: outputs/v6

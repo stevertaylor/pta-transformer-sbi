@@ -30,7 +30,7 @@ from src.priors import FactorizedPrior
 from src.simulator import simulate_pulsar_factorized
 from src.schedules import generate_schedule
 from src.models.model_wrappers import build_model
-from src.models.tokenization import tokenize
+from src.models.tokenization import tokenize, FEAT_KEYS
 from src.importance_sampling import (
     log_likelihood_batch,
     effective_sample_size,
@@ -81,8 +81,7 @@ FIXED_CASES = [
 
 def make_batch(sim, device="cpu"):
     tokens = tokenize(sim.t, sim.sigma, sim.residuals, sim.freq_mhz, sim.backend_id)
-    feat_keys = ["t_norm", "dt_prev", "r_over_sig", "log_sigma", "r_raw", "freq_norm"]
-    features = torch.stack([tokens[k] for k in feat_keys], dim=-1).unsqueeze(0)
+    features = torch.stack([tokens[k] for k in FEAT_KEYS], dim=-1).unsqueeze(0)
     L = len(sim.t)
     return {
         "features":   features.to(device),

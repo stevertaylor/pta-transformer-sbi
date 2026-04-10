@@ -52,19 +52,34 @@ def _log_likelihood_single(
     equad: float = 0.0,
     ecorr: float = 0.0,
     epoch_id: Optional[np.ndarray] = None,
+    backend_id: Optional[np.ndarray] = None,
+    efac_per_backend: Optional[np.ndarray] = None,
+    equad_per_backend: Optional[np.ndarray] = None,
+    ecorr_per_backend: Optional[np.ndarray] = None,
 ) -> float:
     """Exact log p(r | θ) for one parameter combination.
 
     C = D_eff + F Φ_red Fᵀ
     where D_eff = diag(EFAC²σ²+EQUAD²+jitter) [+ F_dm Φ_dm F_dm^T] [+ ECORR² U U^T]
     log p = -0.5 [ N log(2π) + log|C| + rᵀ C⁻¹ r ]
+
+    Per-backend WN: when efac_per_backend/equad_per_backend/ecorr_per_backend
+    are provided (arrays of length n_backends), they are applied per-TOA via
+    backend_id.  Scalar efac/equad/ecorr are ignored in that case.
     """
     N = len(residuals)
     rho_red = power_law_spectrum(n_modes, tspan, log10_A, gamma)
     phi_red = np.repeat(rho_red, 2).astype(np.float64)
 
     F64 = F.astype(np.float64)
-    d = (efac * sigma.astype(np.float64)) ** 2 + equad**2 + jitter
+    sigma64 = sigma.astype(np.float64)
+
+    if efac_per_backend is not None and backend_id is not None:
+        efac_toa = efac_per_backend[backend_id]
+        equad_toa = equad_per_backend[backend_id]
+        d = (efac_toa * sigma64) ** 2 + equad_toa**2 + jitter
+    else:
+        d = (efac * sigma64) ** 2 + equad**2 + jitter
     C = np.diag(d) + F64 @ np.diag(phi_red) @ F64.T
 
     # DM contribution
@@ -74,10 +89,23 @@ def _log_likelihood_single(
         F_dm64 = F_dm.astype(np.float64)
         C += F_dm64 @ np.diag(phi_dm) @ F_dm64.T
 
-    # ECORR contribution
-    if ecorr > 0 and epoch_id is not None:
+    # ECORR contribution (per-backend or scalar)
+    if epoch_id is not None:
         U = build_ecorr_matrix(epoch_id).astype(np.float64)
-        C += ecorr**2 * (U @ U.T)
+        if ecorr_per_backend is not None and backend_id is not None:
+            # Per-backend ECORR: scale each epoch column by its backend's ecorr
+            # Determine which backend each epoch belongs to
+            n_epochs = U.shape[1]
+            ecorr_per_epoch = np.zeros(n_epochs, dtype=np.float64)
+            for e in range(n_epochs):
+                toa_idx = np.where(epoch_id == e)[0]
+                if len(toa_idx) > 0:
+                    ecorr_per_epoch[e] = ecorr_per_backend[backend_id[toa_idx[0]]]
+            # C += U @ diag(ecorr²) @ U^T
+            U_scaled = U * ecorr_per_epoch[None, :]
+            C += U_scaled @ U_scaled.T
+        elif ecorr > 0:
+            C += ecorr**2 * (U @ U.T)
 
     try:
         L = np.linalg.cholesky(C)
@@ -107,16 +135,30 @@ def _build_d_eff(
     equad: float = 0.0,
     ecorr: float = 0.0,
     epoch_id: Optional[np.ndarray] = None,
+    backend_id: Optional[np.ndarray] = None,
+    efac_per_backend: Optional[np.ndarray] = None,
+    equad_per_backend: Optional[np.ndarray] = None,
+    ecorr_per_backend: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Build the effective 'diagonal' noise matrix D_eff.
 
     D_eff = diag(EFAC²σ² + EQUAD² + jitter)
             [+ F_dm Φ_dm F_dm^T]  [+ ECORR² U U^T]
 
+    Per-backend WN: when *_per_backend arrays are provided (length n_backends),
+    they override the scalar efac/equad/ecorr via backend_id mapping.
+
     Returns (N, N) dense symmetric matrix.
     """
     N = len(sigma)
-    d = (efac * sigma.astype(np.float64)) ** 2 + equad**2 + jitter
+    sigma64 = sigma.astype(np.float64)
+
+    if efac_per_backend is not None and backend_id is not None:
+        efac_toa = efac_per_backend[backend_id]
+        equad_toa = equad_per_backend[backend_id]
+        d = (efac_toa * sigma64) ** 2 + equad_toa**2 + jitter
+    else:
+        d = (efac * sigma64) ** 2 + equad**2 + jitter
     D_eff = np.diag(d)
 
     if F_dm is not None and log10_A_dm is not None:
@@ -125,9 +167,19 @@ def _build_d_eff(
         F_dm64 = F_dm.astype(np.float64)
         D_eff += F_dm64 @ np.diag(phi_dm) @ F_dm64.T
 
-    if ecorr > 0 and epoch_id is not None:
+    if epoch_id is not None:
         U = build_ecorr_matrix(epoch_id).astype(np.float64)
-        D_eff += ecorr**2 * (U @ U.T)
+        if ecorr_per_backend is not None and backend_id is not None:
+            n_epochs = U.shape[1]
+            ecorr_per_epoch = np.zeros(n_epochs, dtype=np.float64)
+            for e in range(n_epochs):
+                toa_idx = np.where(epoch_id == e)[0]
+                if len(toa_idx) > 0:
+                    ecorr_per_epoch[e] = ecorr_per_backend[backend_id[toa_idx[0]]]
+            U_scaled = U * ecorr_per_epoch[None, :]
+            D_eff += U_scaled @ U_scaled.T
+        elif ecorr > 0:
+            D_eff += ecorr**2 * (U @ U.T)
 
     return D_eff
 
@@ -149,6 +201,10 @@ def compute_log_likelihood_grid(
     equad: float = 0.0,
     ecorr: float = 0.0,
     epoch_id: Optional[np.ndarray] = None,
+    backend_id: Optional[np.ndarray] = None,
+    efac_per_backend: Optional[np.ndarray] = None,
+    equad_per_backend: Optional[np.ndarray] = None,
+    ecorr_per_backend: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Evaluate log-likelihood on a 2-D grid over (log10_A_red, gamma_red).
 
@@ -162,7 +218,10 @@ def compute_log_likelihood_grid(
     nA = len(log10_A_grid)
     nG = len(gamma_grid)
 
-    has_nuisance = (F_dm is not None) or (ecorr > 0) or (efac != 1.0) or (equad != 0.0)
+    has_nuisance = (
+        (F_dm is not None) or (ecorr > 0) or (efac != 1.0) or (equad != 0.0)
+        or (efac_per_backend is not None)
+    )
 
     if has_nuisance:
         # --- Build dense D_eff and precompute its Cholesky ---
@@ -178,6 +237,10 @@ def compute_log_likelihood_grid(
             equad,
             ecorr,
             epoch_id,
+            backend_id,
+            efac_per_backend,
+            equad_per_backend,
+            ecorr_per_backend,
         )
         L_eff = np.linalg.cholesky(D_eff)
         log_det_D_eff = 2.0 * np.sum(np.log(np.diag(L_eff)))
@@ -280,12 +343,24 @@ def exact_posterior_grid(
         extra_kwargs["F_dm"] = F_dm
         extra_kwargs["log10_A_dm"] = float(tf["log10_A_dm"])
         extra_kwargs["gamma_dm"] = float(tf["gamma_dm"])
-    if "EFAC" in tf:
-        extra_kwargs["efac"] = float(tf["EFAC"])
-    if "log10_EQUAD" in tf:
-        extra_kwargs["equad"] = 10.0 ** float(tf["log10_EQUAD"])
-    if "log10_ECORR" in tf:
-        extra_kwargs["ecorr"] = 10.0 ** float(tf["log10_ECORR"])
+
+    # Per-backend WN (EFAC_0, EFAC_1, ...) takes priority over scalar WN
+    n_backends_wn = sum(1 for k in tf if k.startswith("EFAC_"))
+    if n_backends_wn > 0:
+        efac_pb = np.array([float(tf[f"EFAC_{b}"]) for b in range(n_backends_wn)], dtype=np.float64)
+        equad_pb = np.array([10.0 ** float(tf[f"log10_EQUAD_{b}"]) for b in range(n_backends_wn)], dtype=np.float64)
+        ecorr_pb = np.array([10.0 ** float(tf[f"log10_ECORR_{b}"]) for b in range(n_backends_wn)], dtype=np.float64)
+        extra_kwargs["efac_per_backend"] = efac_pb
+        extra_kwargs["equad_per_backend"] = equad_pb
+        extra_kwargs["ecorr_per_backend"] = ecorr_pb
+        extra_kwargs["backend_id"] = tf["backend_id"]
+    else:
+        if "EFAC" in tf:
+            extra_kwargs["efac"] = float(tf["EFAC"])
+        if "log10_EQUAD" in tf:
+            extra_kwargs["equad"] = 10.0 ** float(tf["log10_EQUAD"])
+        if "log10_ECORR" in tf:
+            extra_kwargs["ecorr"] = 10.0 ** float(tf["log10_ECORR"])
     if "epoch_id" in tf:
         extra_kwargs["epoch_id"] = tf["epoch_id"]
 

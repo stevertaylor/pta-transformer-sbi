@@ -18,7 +18,7 @@ from .utils import load_config, set_seed, get_device
 from .priors import UniformPrior
 from .schedules import generate_schedule
 from .simulator import simulate_pulsar
-from .models.tokenization import tokenize
+from .models.tokenization import tokenize, FEAT_KEYS
 from .exact_posterior import exact_posterior_grid
 from .models.model_wrappers import build_model
 
@@ -80,9 +80,8 @@ def main():
 
     # Prepare batch
     tokens = tokenize(sim.t, sim.sigma, sim.residuals, sim.freq_mhz, sim.backend_id)
-    feat_keys = ["t_norm", "dt_prev", "r_over_sig", "log_sigma", "r_raw", "freq_norm"]
     features = (
-        torch.stack([tokens[k] for k in feat_keys], dim=-1).unsqueeze(0).to(device)
+        torch.stack([tokens[k] for k in FEAT_KEYS], dim=-1).unsqueeze(0).to(device)
     )
     backend_id = tokens["backend_id"].unsqueeze(0).to(device)
     mask = torch.ones(1, len(sim.t), dtype=torch.bool, device=device)

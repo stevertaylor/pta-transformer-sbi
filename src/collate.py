@@ -5,6 +5,8 @@ from __future__ import annotations
 import torch
 from typing import List
 
+from .models.tokenization import FEAT_KEYS
+
 
 def collate_fn(batch: List[dict]) -> dict:
     """Collate a list of dataset items into a padded batch.
@@ -31,8 +33,9 @@ def collate_fn(batch: List[dict]) -> dict:
     seq_lens = [item["seq_len"] for item in batch]
     L_max = max(seq_lens)
 
-    # Continuous feature keys (order matters – must match model expectation)
-    feat_keys = ["t_norm", "dt_prev", "r_over_sig", "log_sigma", "r_raw", "freq_norm"]
+    # Continuous feature keys (order matters – must match model expectation).
+    # Canonical list lives in models.tokenization.FEAT_KEYS.
+    feat_keys = FEAT_KEYS
     n_feat = len(feat_keys)
 
     features = torch.zeros(B, L_max, n_feat)

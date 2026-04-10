@@ -31,7 +31,14 @@ def log_likelihood(
     sim: SimulatedPulsar,
     jitter: float = 1e-20,
 ) -> float:
-    """Evaluate exact log p(r | θ) for a single parameter vector."""
+    """Evaluate exact log p(r | θ) for a single parameter vector.
+
+    Supports:
+      D=2: (log10_A_red, gamma_red)
+      D=4: + (log10_A_dm, gamma_dm)
+      D=7: + (EFAC, log10_EQUAD, log10_ECORR) — single backend
+      D=4+3N (N>1): + per-backend (EFAC_b, log10_EQUAD_b, log10_ECORR_b)
+    """
     D = len(theta)
     kwargs = dict(
         residuals=sim.residuals,
@@ -47,12 +54,28 @@ def log_likelihood(
         kwargs["F_dm"] = sim.F_dm
         kwargs["log10_A_dm"] = float(theta[2])
         kwargs["gamma_dm"] = float(theta[3])
-    if D >= 6:
+    if D == 7:
+        # Single-backend WN
         kwargs["efac"] = float(theta[4])
         kwargs["equad"] = 10.0 ** float(theta[5])
-    if D >= 7:
         kwargs["ecorr"] = 10.0 ** float(theta[6])
         kwargs["epoch_id"] = sim.epoch_id
+    elif D > 7 and (D - 4) % 3 == 0:
+        # Multi-backend WN: theta[4:] = [EFAC_0, log10_EQUAD_0, log10_ECORR_0, ...]
+        n_backends = (D - 4) // 3
+        wn_flat = theta[4:].reshape(n_backends, 3)
+        kwargs["efac_per_backend"] = wn_flat[:, 0].astype(np.float64)
+        kwargs["equad_per_backend"] = (10.0 ** wn_flat[:, 1]).astype(np.float64)
+        kwargs["ecorr_per_backend"] = (10.0 ** wn_flat[:, 2]).astype(np.float64)
+        kwargs["backend_id"] = sim.backend_id
+        kwargs["epoch_id"] = sim.epoch_id
+    elif D >= 6:
+        # Fallback for D=5 or D=6 (partial WN)
+        kwargs["efac"] = float(theta[4])
+        kwargs["equad"] = 10.0 ** float(theta[5])
+        if D >= 7:
+            kwargs["ecorr"] = 10.0 ** float(theta[6])
+            kwargs["epoch_id"] = sim.epoch_id
     return _log_likelihood_single(**kwargs)
 
 

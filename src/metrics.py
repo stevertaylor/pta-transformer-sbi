@@ -7,18 +7,22 @@ from typing import Tuple
 
 
 def hellinger_distance_grid(p: np.ndarray, q: np.ndarray) -> float:
-    """Hellinger distance between two 2-D probability grids (must be normalised).
+    """Hellinger distance between two nonneg density grids on a common uniform grid.
 
-    H(P,Q) = (1/sqrt(2)) * sqrt( sum( (sqrt(p) - sqrt(q))^2 * dA ) )
+    Converts densities to PMFs (normalise to sum=1) then computes
+    H(P,Q) = (1/sqrt(2)) * sqrt( sum( (sqrt(p_i) - sqrt(q_i))^2 ) )
 
-    Assumes grids share the same cell area.
+    Returns 0 for identical distributions, up to 1 for disjoint support.
     """
-    sp = np.sqrt(np.maximum(p, 0))
-    sq = np.sqrt(np.maximum(q, 0))
-    # Normalise to unit integral
-    sp = sp / (sp.sum() + 1e-30)
-    sq = sq / (sq.sum() + 1e-30)
-    return float(np.sqrt(0.5 * np.sum((sp - sq) ** 2)))
+    p_pmf = np.maximum(p, 0).astype(np.float64)
+    q_pmf = np.maximum(q, 0).astype(np.float64)
+    p_sum = p_pmf.sum()
+    q_sum = q_pmf.sum()
+    if p_sum <= 0 or q_sum <= 0:
+        return 1.0
+    p_pmf /= p_sum
+    q_pmf /= q_sum
+    return float(np.sqrt(0.5 * np.sum((np.sqrt(p_pmf) - np.sqrt(q_pmf)) ** 2)))
 
 
 def calibration_percentiles(

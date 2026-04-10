@@ -1,5 +1,4 @@
-# Smoke test for v5 factorized architecture – runs fast on CPU
-# Factorized: global 4D flow + per-backend 3D WN flow (shared weights)
+# Smoke test for v6b factorized architecture
 data:
   train_samples: 2000
   val_samples: 200
@@ -10,8 +9,9 @@ data:
   tspan_min_yr: 5.0
   tspan_max_yr: 10.0
   jitter: 1.0e-20
-  train_masking_severity: 0.5
-  val_masking_severity: 0.15
+  use_sobol: true
+  train_masking_severity: 0.0
+  val_masking_severity: 0.0
 
 prior:
   global:
@@ -27,10 +27,8 @@ prior:
 model:
   factorized: true
   n_backends_max: 4
-  context_dropout: 0.2
+  context_dropout: 0.0
   wn_loss_weight: 1.0
-  global_context_proj_dim: 16
-  wn_context_proj_dim: 64
   d_model: 64
   nhead: 4
   num_layers: 2
@@ -41,12 +39,12 @@ model:
   use_aux_features: true
   lstm_hidden: 64
   lstm_layers: 2
-  # Global flow (4D)
-  global_flow_transforms: 3
-  global_flow_hidden: 48
+  # Global flow – proportionally scaled down but larger than WN
+  global_flow_transforms: 4
+  global_flow_hidden: 64
   global_flow_layers: 2
   global_flow_bins: 8
-  # WN flow (3D, shared across backends)
+  # WN flow – small, matching v5 proportions
   wn_flow_transforms: 3
   wn_flow_hidden: 48
   wn_flow_layers: 2
@@ -70,4 +68,4 @@ eval:
   n_test_exact: 20
   masking_levels: [0.0, 0.3, 0.6]
 
-output_dir: outputs/smoke_v5
+output_dir: outputs/smoke_v6b

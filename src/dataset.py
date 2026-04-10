@@ -14,14 +14,27 @@ from .masking import apply_random_masking
 from .models.tokenization import tokenize
 
 
-def _post_process(sim: SimulatedPulsar, rng, masking_severity, augment, extra=None):
+def _post_process(
+    sim: SimulatedPulsar,
+    rng,
+    masking_severity,
+    augment,
+    extra=None,
+    deterministic_augment=False,
+):
     """Apply masking, tokenize, and build output dict."""
     sev = masking_severity
     if augment and sev > 0:
-        # Use non-deterministic RNG for augmentation so masking varies
-        # across epochs (the deterministic rng is consumed by schedule +
-        # simulation and would produce identical masking every epoch).
-        aug_rng = np.random.default_rng()
+        if deterministic_augment:
+            # Reuse the per-sample seeded rng so val masking is reproducible
+            # across epochs (same idx → same mask). rng has already been
+            # consumed by schedule+simulation but its remaining state is
+            # still deterministic per idx.
+            aug_rng = rng
+        else:
+            # Non-deterministic RNG for training so masking varies across
+            # epochs (the seeded rng would otherwise produce identical masks).
+            aug_rng = np.random.default_rng()
         sev_sample = aug_rng.uniform(0, sev)
         keep = apply_random_masking(sim.t, aug_rng, severity=sev_sample)
     else:
@@ -78,6 +91,7 @@ class PulsarDataset(Dataset):
         use_sobol: bool = False,
         factorized: bool = False,
         reseed_per_epoch: bool = False,
+        deterministic_augment: bool = False,
     ):
         self.n_samples = n_samples
         self.prior = prior
@@ -87,6 +101,7 @@ class PulsarDataset(Dataset):
         self.augment = augment
         self.factorized = factorized
         self.reseed_per_epoch = reseed_per_epoch
+        self.deterministic_augment = deterministic_augment
         self._epoch = 0
 
         if factorized:
@@ -133,6 +148,7 @@ class PulsarDataset(Dataset):
             tspan_max_yr=self.data_cfg.get("tspan_max_yr", 15.0),
             n_toa_min=self.data_cfg.get("n_toa_min", 80),
             n_toa_max=self.data_cfg.get("n_toa_max", 400),
+            n_backends_fixed=self.data_cfg.get("n_backends_fixed", None),
         )
 
         n_modes = self.data_cfg.get("n_fourier_modes", 30)
@@ -147,13 +163,27 @@ class PulsarDataset(Dataset):
         else:
             theta = self.prior.sample(1, rng=rng).squeeze(0).numpy()
 
-        sim = simulate_pulsar(theta, schedule, n_modes=n_modes, rng=rng)
+        n_backends_fixed = self.data_cfg.get("n_backends_fixed", None)
+        if n_backends_fixed is not None and len(theta) > 7:
+            # Monolithic multi-backend: split flat theta into global + per-backend WN
+            # and simulate with per-backend white noise
+            theta_global = theta[:4]
+            theta_wn = theta[4:].reshape(n_backends_fixed, 3)
+            sim = simulate_pulsar_factorized(
+                theta_global, theta_wn, schedule, n_modes=n_modes, rng=rng,
+            )
+            # Return the flat theta for the monolithic flow
+            sim.theta = theta.astype(np.float32)
+        else:
+            sim = simulate_pulsar(theta, schedule, n_modes=n_modes, rng=rng)
+
         return _post_process(
             sim,
             rng,
             self.masking_severity,
             self.augment,
             extra={"theta": torch.from_numpy(sim.theta)},
+            deterministic_augment=self.deterministic_augment,
         )
 
     def _getitem_factorized(self, idx, rng, schedule, n_modes):
@@ -196,6 +226,7 @@ class PulsarDataset(Dataset):
                 "theta_wn": theta_wn_padded,
                 "backend_active": backend_active,
             },
+            deterministic_augment=self.deterministic_augment,
         )
 
 
@@ -220,6 +251,7 @@ class FixedPulsarDataset(Dataset):
                 tspan_max_yr=data_cfg.get("tspan_max_yr", 15.0),
                 n_toa_min=data_cfg.get("n_toa_min", 80),
                 n_toa_max=data_cfg.get("n_toa_max", 400),
+                n_backends_fixed=data_cfg.get("n_backends_fixed", None),
             )
             n_modes = data_cfg.get("n_fourier_modes", 30)
 
@@ -251,7 +283,17 @@ class FixedPulsarDataset(Dataset):
                 }
             else:
                 theta = prior.sample(1, rng=rng).squeeze(0).numpy()
-                sim = simulate_pulsar(theta, schedule, n_modes=n_modes, rng=rng)
+                n_bf = data_cfg.get("n_backends_fixed", None)
+                if n_bf is not None and len(theta) > 7:
+                    theta_global = theta[:4]
+                    theta_wn = theta[4:].reshape(n_bf, 3)
+                    sim = simulate_pulsar_factorized(
+                        theta_global, theta_wn, schedule,
+                        n_modes=n_modes, rng=rng,
+                    )
+                    sim.theta = theta.astype(np.float32)
+                else:
+                    sim = simulate_pulsar(theta, schedule, n_modes=n_modes, rng=rng)
                 extra = {"theta": torch.from_numpy(sim.theta)}
 
             tokens = tokenize(

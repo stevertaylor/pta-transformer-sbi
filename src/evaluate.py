@@ -28,7 +28,7 @@ from .collate import collate_fn
 from .models.model_wrappers import build_model
 from .exact_posterior import exact_posterior_grid
 from .masking import apply_random_masking
-from .models.tokenization import tokenize
+from .models.tokenization import tokenize, FEAT_KEYS
 from .metrics import (
     hellinger_distance_grid,
     calibration_percentiles,
@@ -37,6 +37,7 @@ from .metrics import (
 )
 from .plots import plot_posterior_comparison, plot_pp, plot_robustness
 from .importance_sampling import importance_sample, weighted_percentile_rank
+from .simulator import build_fourier_design_matrix, build_dm_design_matrix
 
 
 def parse_args():
@@ -81,8 +82,7 @@ def _make_batch_single(sim_item, mask_keep=None, device="cpu"):
     L = len(t)
     tspan_yr = float(t.max() - t.min()) if L > 1 else 0.0
 
-    feat_keys = ["t_norm", "dt_prev", "r_over_sig", "log_sigma", "r_raw", "freq_norm"]
-    features = torch.stack([tokens[k] for k in feat_keys], dim=-1).unsqueeze(0)
+    features = torch.stack([tokens[k] for k in FEAT_KEYS], dim=-1).unsqueeze(0)
     backend_id = tokens["backend_id"].unsqueeze(0)
     mask = torch.ones(1, L, dtype=torch.bool)
 
@@ -107,6 +107,9 @@ def _build_theta_fixed(sim, prior_param_names):
 
     Fixes all nuisance parameters (everything except log10_A_red and gamma_red)
     at their true values.  For factorized sims uses theta_global / theta_wn.
+
+    Per-backend WN keys (EFAC_0, log10_EQUAD_0, etc.) are detected from
+    prior_param_names and passed through along with backend_id.
     """
     tf = {}
     if sim.theta_global is not None:
@@ -127,7 +130,35 @@ def _build_theta_fixed(sim, prior_param_names):
             tf[name] = float(sim.theta[i])
     if sim.epoch_id is not None:
         tf["epoch_id"] = sim.epoch_id
+    # Pass backend_id for per-backend WN evaluation
+    has_per_backend_wn = any(k.startswith("EFAC_") for k in tf)
+    if has_per_backend_wn and sim.backend_id is not None:
+        tf["backend_id"] = sim.backend_id
     return tf
+
+
+def _masked_exact_inputs(sim, keep):
+    """Build exact-posterior inputs from masked TOAs.
+
+    Recomputes tspan, F, and F_dm from the masked times so that the exact
+    posterior conditions on the same observation as the learned model.
+    """
+    t_m = sim.t[keep]
+    tspan_m = float(t_m.max() - t_m.min()) if len(t_m) > 1 else sim.tspan
+    F_m = build_fourier_design_matrix(t_m, tspan_m, sim.n_modes)
+    F_dm_m = None
+    if sim.F_dm is not None:
+        freq_m = sim.freq_mhz[keep]
+        F_dm_m = build_dm_design_matrix(F_m, freq_m)
+    return {
+        "residuals": sim.residuals[keep],
+        "sigma": sim.sigma[keep],
+        "F": F_m,
+        "tspan": tspan_m,
+        "F_dm": F_dm_m,
+        "epoch_id": sim.epoch_id[keep] if sim.epoch_id is not None else None,
+        "backend_id": sim.backend_id[keep] if sim.backend_id is not None else None,
+    }
 
 
 def evaluate_model(
@@ -161,6 +192,10 @@ def evaluate_model(
     all_means = []
     exact_posts_out = []
     learned_posts_out = []
+    # Factorized WN collection: one entry per (example, active-backend) pair
+    wn_true_list = []
+    wn_samples_list = []
+    wn_means_list = []
 
     rng = np.random.default_rng(seed)
     n_eval = min(n_exact, len(dataset))
@@ -180,19 +215,36 @@ def evaluate_model(
         # --- Exact posterior (2-D grid over A_red, gamma_red) ---
         exact = None
         if do_exact_grid:
+            # Use masked inputs so the exact posterior conditions on the
+            # same observation the learned model sees.
+            if keep is not None:
+                mi = _masked_exact_inputs(sim, keep)
+                ex_residuals, ex_sigma = mi["residuals"], mi["sigma"]
+                ex_F, ex_tspan, ex_F_dm = mi["F"], mi["tspan"], mi["F_dm"]
+            else:
+                ex_residuals, ex_sigma = sim.residuals, sim.sigma
+                ex_F, ex_tspan, ex_F_dm = sim.F, sim.tspan, sim.F_dm
+
             theta_fixed = None
             if theta_dim > 2:
                 theta_fixed = _build_theta_fixed(sim, param_names)
+                # Override epoch_id/backend_id with masked versions
+                if keep is not None:
+                    if "epoch_id" in theta_fixed and sim.epoch_id is not None:
+                        theta_fixed["epoch_id"] = sim.epoch_id[keep]
+                    if "backend_id" in theta_fixed and sim.backend_id is not None:
+                        theta_fixed["backend_id"] = sim.backend_id[keep]
+
             exact = exact_posterior_grid(
-                sim.residuals,
-                sim.sigma,
-                sim.F,
-                sim.tspan,
+                ex_residuals,
+                ex_sigma,
+                ex_F,
+                ex_tspan,
                 sim.n_modes,
                 prior_bounds,
                 n_grid=n_grid,
                 jitter=jitter,
-                F_dm=sim.F_dm,
+                F_dm=ex_F_dm,
                 theta_fixed=theta_fixed,
             )
 
@@ -259,9 +311,21 @@ def evaluate_model(
         # --- Samples for calibration ---
         raw = model.sample_posterior(batch, n_posterior_samples)
         if is_factorized:
-            # Returns (global_samples, wn_samples); use global (B, S, 4)
-            samples_t = raw[0][0]   # (S, 4)
+            # Returns (global_samples, wn_samples).
+            global_samples = raw[0]   # (B=1, S, 4)
+            wn_samples = raw[1]       # (B=1, Bmax, S, 3)
+            samples_t = global_samples[0]   # (S, 4)
             true_theta = sim.theta_global
+
+            # Collect per-backend WN posterior over active backends only.
+            wn_np = wn_samples[0].cpu().numpy()  # (Bmax, S, 3)
+            backend_active = item["backend_active"].numpy()  # (Bmax,)
+            theta_wn_true = item["theta_wn"].numpy()  # (Bmax, 3)
+            for b in range(len(backend_active)):
+                if bool(backend_active[b]):
+                    wn_true_list.append(theta_wn_true[b])
+                    wn_samples_list.append(wn_np[b])
+                    wn_means_list.append(wn_np[b].mean(axis=0))
         else:
             samples_t = raw[0]      # (S, D)
             true_theta = sim.theta
@@ -300,6 +364,33 @@ def evaluate_model(
 
     result["exact_posts"] = exact_posts_out
     result["learned_posts"] = learned_posts_out
+
+    # Factorized WN posterior metrics, pooled across all active backends.
+    # Every (example, active-backend) pair contributes one draw to the KS test,
+    # since the WN flow is shared across backends.
+    if is_factorized and len(wn_true_list) > 0:
+        wn_true_arr = np.array(wn_true_list)            # (N_active, 3)
+        wn_samples_arr = np.array(wn_samples_list)      # (N_active, S, 3)
+        wn_means_arr = np.array(wn_means_list)          # (N_active, 3)
+        wn_param_names = list(cfg["prior"]["white_noise"].keys())
+        wn_dim = wn_true_arr.shape[1]
+
+        wn_pctls = calibration_percentiles(wn_true_arr, wn_samples_arr)
+        wn_ks_per = [ks_statistic(wn_pctls[:, d]) for d in range(wn_dim)]
+        wn_pe = point_estimate_error(wn_true_arr, wn_means_arr)
+
+        result["wn_param_names"] = wn_param_names
+        result["wn_n_active"] = int(len(wn_true_list))
+        result["wn_ks_per_param"] = {
+            name: float(wn_ks_per[d]) for d, name in enumerate(wn_param_names)
+        }
+        result["wn_ks_mean"] = float(np.mean(wn_ks_per))
+        result["wn_point_error"] = float(np.mean(wn_pe))
+        result["wn_point_error_per_param"] = {
+            name: float(np.mean(wn_pe[:, d]))
+            for d, name in enumerate(wn_param_names)
+        }
+        result["wn_percentiles"] = wn_pctls
 
     # Legacy keys (always present for backward compat)
     result["ks_log10A"] = ks_per_param[0] if theta_dim >= 1 else float("nan")
@@ -533,10 +624,20 @@ def main():
                 "ks_mean": r["ks_mean"],
                 "point_error": r["point_error"],
             }
-            # Per-param KS and point error
+            # Per-param KS and point error (global)
             for pn in param_names:
                 entry[f"ks_{pn}"] = r["ks_per_param"].get(pn, float("nan"))
                 entry[f"pe_{pn}"] = r["point_error_per_param"].get(pn, float("nan"))
+            # WN (factorized-only): pooled per-backend metrics
+            if "wn_ks_mean" in r:
+                entry["wn_ks_mean"] = r["wn_ks_mean"]
+                entry["wn_point_error"] = r["wn_point_error"]
+                entry["wn_n_active"] = r["wn_n_active"]
+                for wpn in r.get("wn_param_names", []):
+                    entry[f"wn_ks_{wpn}"] = r["wn_ks_per_param"].get(wpn, float("nan"))
+                    entry[f"wn_pe_{wpn}"] = r["wn_point_error_per_param"].get(
+                        wpn, float("nan")
+                    )
             summary[name][str(sev)] = entry
 
     # Include IS results in summary
@@ -568,9 +669,17 @@ def main():
                     f"  KS_IS={s['ks_is_mean']:.4f}"
                 )
             else:
-                print(
-                    f"    mask={sev}: H={s['hellinger']:.4f} KS={s['ks_mean']:.4f} PE={s['point_error']:.4f}"
+                line = (
+                    f"    mask={sev}: H={s['hellinger']:.4f} "
+                    f"KS={s['ks_mean']:.4f} PE={s['point_error']:.4f}"
                 )
+                if "wn_ks_mean" in s:
+                    line += (
+                        f"  |  WN KS={s['wn_ks_mean']:.4f} "
+                        f"PE={s['wn_point_error']:.4f} "
+                        f"(n_active={s['wn_n_active']})"
+                    )
+                print(line)
 
 
 if __name__ == "__main__":

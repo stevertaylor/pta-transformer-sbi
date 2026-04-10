@@ -1,0 +1,59 @@
+# Smoke test for v4e architecture – validates tighter EFAC, reseeding, per-group WD, EMA
+data:
+  train_samples: 2000
+  val_samples: 200
+  test_samples: 200
+  n_fourier_modes: 20
+  n_toa_min: 60
+  n_toa_max: 200
+  tspan_min_yr: 5.0
+  tspan_max_yr: 10.0
+  jitter: 1.0e-20
+  reseed_per_epoch: true
+
+prior:
+  log10_A_red: [-17, -11]
+  gamma_red: [0.5, 6.5]
+  log10_A_dm: [-17, -11]
+  gamma_dm: [0.5, 6.5]
+  EFAC: [0.5, 2.0]
+  log10_EQUAD: [-8, -5]
+  log10_ECORR: [-8, -5]
+
+model:
+  d_model: 64
+  nhead: 4
+  num_layers: 2
+  dim_feedforward: 128
+  dropout: 0.1
+  context_dim: 32
+  use_rope: true
+  use_aux_features: true
+  lstm_hidden: 64
+  lstm_layers: 2
+  flow_transforms: 4
+  flow_hidden: 64
+  flow_layers: 2
+  flow_bins: 8
+
+training:
+  epochs: 3
+  batch_size: 32
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  flow_weight_decay: 5.0e-4
+  grad_clip: 5.0
+  patience: 5
+  seed: 42
+  warmup_fraction: 0.33
+  use_amp: false
+  num_workers: 0
+  ema_alpha: 0.15
+
+eval:
+  n_grid: 60
+  n_posterior_samples: 500
+  n_test_exact: 20
+  masking_levels: [0.0, 0.3, 0.6]
+
+output_dir: outputs/smoke_v4e

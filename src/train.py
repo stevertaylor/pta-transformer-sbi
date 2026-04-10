@@ -22,7 +22,7 @@ from .utils import load_config, set_seed, get_device, ensure_dir
 from .priors import UniformPrior, FactorizedPrior
 from .dataset import PulsarDataset
 from .collate import collate_fn
-from .models.model_wrappers import build_model, FactorizedNPEModel
+from .models.model_wrappers import build_model, FactorizedNPEModel, NPEModel
 from .plots import plot_training_curves
 
 
@@ -67,6 +67,11 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Path to log file (appends). Duplicates stdout to file.",
+    )
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume training from best_model.pt checkpoint.",
     )
     return p.parse_args()
 
@@ -173,13 +178,15 @@ def _run_training(args, cfg):
     data_cfg = cfg.get("data", {})
     use_sobol = data_cfg.get("use_sobol", False)
     reseed_per_epoch = data_cfg.get("reseed_per_epoch", False)
+    train_masking_severity = data_cfg.get("train_masking_severity", 0.5)
+    val_masking_severity = data_cfg.get("val_masking_severity", 0.0)
     train_ds = PulsarDataset(
         n_samples=cfg["data"]["train_samples"],
         prior=prior,
         data_cfg=cfg["data"],
         seed=tcfg["seed"],
-        masking_severity=0.5,
-        augment=True,
+        masking_severity=train_masking_severity,
+        augment=train_masking_severity > 0,
         use_sobol=use_sobol,
         factorized=factorized,
         reseed_per_epoch=reseed_per_epoch,
@@ -189,10 +196,15 @@ def _run_training(args, cfg):
         prior=prior,
         data_cfg=cfg["data"],
         seed=tcfg["seed"] + 1_000_000,
-        masking_severity=0.0,
-        augment=False,
+        masking_severity=val_masking_severity,
+        augment=val_masking_severity > 0,
         use_sobol=use_sobol,
         factorized=factorized,
+        deterministic_augment=True,
+    )
+    print(
+        f"Masking: train={train_masking_severity} "
+        f"val={val_masking_severity} (deterministic)"
     )
 
     num_workers = tcfg.get("num_workers", 0)
@@ -229,6 +241,17 @@ def _run_training(args, cfg):
             for submod in [model.global_flow, model.wn_flow]
             for p in submod.parameters()
         }
+        encoder_params = [p for p in model.parameters() if id(p) not in flow_param_ids]
+        flow_params = [p for p in model.parameters() if id(p) in flow_param_ids]
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": encoder_params, "weight_decay": tcfg["weight_decay"]},
+                {"params": flow_params, "weight_decay": flow_weight_decay},
+            ],
+            lr=tcfg["lr"],
+        )
+    elif isinstance(model, NPEModel) and flow_weight_decay is not None:
+        flow_param_ids = {id(p) for p in model.flow.parameters()}
         encoder_params = [p for p in model.parameters() if id(p) not in flow_param_ids]
         flow_params = [p for p in model.parameters() if id(p) in flow_param_ids]
         optimizer = torch.optim.AdamW(
@@ -288,14 +311,52 @@ def _run_training(args, cfg):
     is_factorized = isinstance(model, FactorizedNPEModel)
     train_global_losses, train_wn_losses = [], []
     val_global_losses, val_wn_losses = [], []
+    start_epoch = 1
+
+    # Resume from checkpoint if requested
+    last_ckpt_path = os.path.join(out_dir, "last_checkpoint.pt")
+    if args.resume and os.path.exists(last_ckpt_path):
+        ckpt = torch.load(last_ckpt_path, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if scaler is not None and "scaler_state_dict" in ckpt:
+            scaler.load_state_dict(ckpt["scaler_state_dict"])
+        start_epoch = ckpt["epoch"] + 1
+        best_val = ckpt.get("best_val", best_val)
+        best_ema_ckpt = ckpt.get("best_ema_ckpt", best_ema_ckpt)
+        best_ema_global = ckpt.get("best_ema_global", best_ema_global)
+        best_ema_wn = ckpt.get("best_ema_wn", best_ema_wn)
+        patience_counter = ckpt.get("patience_counter", 0)
+        patience_wn_counter = ckpt.get("patience_wn_counter", 0)
+        ema_val = ckpt.get("ema_val", None)
+        ema_global_s = ckpt.get("ema_global_s", None)
+        ema_wn_s = ckpt.get("ema_wn_s", None)
+        train_losses = ckpt.get("train_losses", [])
+        val_losses = ckpt.get("val_losses", [])
+        train_global_losses = ckpt.get("train_global_losses", [])
+        train_wn_losses = ckpt.get("train_wn_losses", [])
+        val_global_losses = ckpt.get("val_global_losses", [])
+        val_wn_losses = ckpt.get("val_wn_losses", [])
+        if "scheduler_state_dict" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        else:
+            # Legacy checkpoint without scheduler state — advance manually
+            with torch.no_grad():
+                for _ in range(start_epoch - 1):
+                    scheduler.step()
+        print(f"Resumed from epoch {ckpt['epoch']} (best_ema_ckpt={best_ema_ckpt:.4f})")
 
     if ema_alpha > 0:
         print(f"EMA smoothing: alpha={ema_alpha:.3f} (~{1/ema_alpha:.0f}-epoch window)")
 
     def _ema(prev, cur):
-        return cur if (prev is None or ema_alpha == 0.0) else ema_alpha * cur + (1.0 - ema_alpha) * prev
+        return (
+            cur
+            if (prev is None or ema_alpha == 0.0)
+            else ema_alpha * cur + (1.0 - ema_alpha) * prev
+        )
 
-    for epoch in range(1, tcfg["epochs"] + 1):
+    for epoch in range(start_epoch, tcfg["epochs"] + 1):
         train_ds.set_epoch(epoch)
         t0 = time.time()
         train_result = train_one_epoch(
@@ -364,6 +425,34 @@ def _run_training(args, cfg):
             else:
                 patience_counter += 1
 
+        # Save resumable checkpoint every epoch
+        _last_ckpt = {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "best_val": best_val,
+            "best_ema_ckpt": best_ema_ckpt,
+            "best_ema_global": best_ema_global,
+            "best_ema_wn": best_ema_wn,
+            "patience_counter": patience_counter,
+            "patience_wn_counter": patience_wn_counter,
+            "ema_val": ema_val,
+            "ema_global_s": ema_global_s,
+            "ema_wn_s": ema_wn_s,
+            "train_losses": train_losses,
+            "val_losses": val_losses,
+            "train_global_losses": train_global_losses,
+            "train_wn_losses": train_wn_losses,
+            "val_global_losses": val_global_losses,
+            "val_wn_losses": val_wn_losses,
+            "config": cfg,
+            "model_type": args.model,
+        }
+        _last_ckpt["scheduler_state_dict"] = scheduler.state_dict()
+        if scaler is not None:
+            _last_ckpt["scaler_state_dict"] = scaler.state_dict()
+        torch.save(_last_ckpt, os.path.join(out_dir, "last_checkpoint.pt"))
+
         lr_now = optimizer.param_groups[0]["lr"]
         if is_factorized:
             print(
@@ -378,8 +467,13 @@ def _run_training(args, cfg):
 
         # Early stopping: factorized requires both components to plateau
         if is_factorized:
-            if patience_counter >= tcfg["patience"] and patience_wn_counter >= tcfg["patience"]:
-                print(f"Early stopping at epoch {epoch} (pg={patience_counter} pw={patience_wn_counter})")
+            if (
+                patience_counter >= tcfg["patience"]
+                and patience_wn_counter >= tcfg["patience"]
+            ):
+                print(
+                    f"Early stopping at epoch {epoch} (pg={patience_counter} pw={patience_wn_counter})"
+                )
                 break
         else:
             if patience_counter >= tcfg["patience"]:
