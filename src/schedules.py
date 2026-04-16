@@ -4,8 +4,10 @@ Produces irregular, gappy, variable-length TOA schedules that mimic
 realistic radio-pulsar timing programmes (seasonal windows, cadence
 variations, missing seasons, variable baseline).
 
-Each observing epoch contains 1–3 TOAs at different radio frequencies,
-mimicking real multi-frequency PTA observations.  The epoch_id array
+Each observing epoch contains 2–3 TOAs at different radio frequencies,
+mimicking real multi-frequency PTA observations.  A per-epoch minimum of
+2 is required for ECORR to be identifiable (single-TOA epochs are degenerate
+between ECORR and EQUAD).  The epoch_id array
 groups TOAs by observing session (needed for ECORR noise modelling).
 
 Times are in years.  TOA uncertainties (sigma) are in seconds.
@@ -61,7 +63,7 @@ def generate_schedule(
     * irregular cadence within each season
     * randomly dropped seasons (~20 % chance each)
     * optional cadence thinning in some seasons
-    * 1–3 TOAs per epoch at different frequencies (for ECORR structure)
+    * 2–3 TOAs per epoch at different frequencies (for ECORR structure)
     * heteroskedastic white-noise uncertainties
     * random backend labels
     """
@@ -94,7 +96,7 @@ def generate_schedule(
 
     # ---- target TOA count → adjust epoch count ----
     n_target = rng.integers(n_toa_min, n_toa_max + 1)
-    mean_toa_per_epoch = 2.0  # average TOAs per epoch
+    mean_toa_per_epoch = 2.5  # average TOAs per epoch (2-3, uniform)
     n_epochs_target = max(5, int(n_target / mean_toa_per_epoch))
     if len(epoch_times) > n_epochs_target:
         idx = np.sort(rng.choice(len(epoch_times), size=n_epochs_target, replace=False))
@@ -112,7 +114,7 @@ def generate_schedule(
     all_epoch_id: list[int] = []
 
     for eid, t_epoch in enumerate(epoch_times):
-        n_toa_epoch = rng.integers(1, 4)  # 1–3 TOAs per epoch
+        n_toa_epoch = rng.integers(2, 4)  # 2–3 TOAs per epoch (min 2 for ECORR identifiability)
         n_freq = min(n_toa_epoch, len(freq_choices))
         freqs = rng.choice(freq_choices, size=n_freq, replace=False)
         # If more TOAs than unique freqs, allow repeats
@@ -140,25 +142,55 @@ def generate_schedule(
     # ---- trim to desired range ----
     n = len(t_arr)
     if n > n_toa_max:
-        idx = np.sort(rng.choice(n, size=n_toa_max, replace=False))
-        t_arr = t_arr[idx]
-        sigma_arr = sigma_arr[idx]
-        freq_arr = freq_arr[idx]
-        backend_arr = backend_arr[idx]
-        epoch_arr = epoch_arr[idx]
+        # Drop whole epochs (not individual TOAs) to preserve min-2 per epoch
+        unique_eids = np.unique(epoch_arr)
+        shuffled_eids = rng.permutation(unique_eids)
+        keep_mask = np.zeros(n, dtype=bool)
+        kept = 0
+        for eid in shuffled_eids:
+            eid_mask = epoch_arr == eid
+            m = int(eid_mask.sum())
+            if kept + m > n_toa_max:
+                continue
+            keep_mask |= eid_mask
+            kept += m
+            if kept == n_toa_max:
+                break
+        t_arr = t_arr[keep_mask]
+        sigma_arr = sigma_arr[keep_mask]
+        freq_arr = freq_arr[keep_mask]
+        backend_arr = backend_arr[keep_mask]
+        epoch_arr = epoch_arr[keep_mask]
+        order = np.argsort(t_arr)
+        t_arr = t_arr[order]
+        sigma_arr = sigma_arr[order]
+        freq_arr = freq_arr[order]
+        backend_arr = backend_arr[order]
+        epoch_arr = epoch_arr[order]
     elif n < n_toa_min:
-        # Pad by adding extra single-TOA epochs
+        # Pad by adding extra 2-TOA epochs (min 2 per epoch for ECORR identifiability).
+        # Round up to an even pad so the last epoch isn't a singleton; may slightly
+        # overshoot n_toa_min (by at most 1 TOA).
         n_extra = n_toa_min - n
-        extra_t = np.sort(rng.uniform(t_arr[0], t_arr[-1], size=n_extra)).astype(
-            np.float32
-        )
+        n_extra_epochs = int(np.ceil(n_extra / 2))
+        n_extra = n_extra_epochs * 2  # always even
+        epoch_t = np.sort(
+            rng.uniform(t_arr[0], t_arr[-1], size=n_extra_epochs)
+        ).astype(np.float32)
+        next_eid = epoch_arr.max() + 1 if len(epoch_arr) > 0 else 0
+        extra_t_list, extra_epoch_list = [], []
+        for k in range(n_extra_epochs):
+            for _ in range(2):
+                dt_offset = rng.uniform(0, 0.5 / (365.25 * 24))
+                extra_t_list.append(epoch_t[k] + dt_offset)
+                extra_epoch_list.append(next_eid + k)
+        extra_t = np.array(extra_t_list, dtype=np.float32)
         extra_sigma = (
             10 ** rng.uniform(log_sig_low, log_sig_high, size=n_extra)
         ).astype(np.float32)
         extra_freq = rng.choice(freq_choices, size=n_extra).astype(np.float32)
         extra_backend = rng.integers(0, n_backends, size=n_extra).astype(np.int64)
-        next_eid = epoch_arr.max() + 1 if len(epoch_arr) > 0 else 0
-        extra_epoch = np.arange(next_eid, next_eid + n_extra, dtype=np.int64)
+        extra_epoch = np.array(extra_epoch_list, dtype=np.int64)
 
         t_arr = np.concatenate([t_arr, extra_t])
         sigma_arr = np.concatenate([sigma_arr, extra_sigma])

@@ -208,30 +208,52 @@ def importance_sample(
     is_factorized = hasattr(model, "global_flow")
 
     if is_factorized:
-        # --- Factorized model: IS on global posterior ---
-        # 1. Global samples
-        global_samples, _ = model.sample_posterior(batch, n_samples)  # (1, S, 4)
-        samples_t = global_samples[0]   # (S, 4)
-        samples_np = samples_t.cpu().numpy().astype(np.float64)
+        # --- Autoregressive factorized model: joint IS over (θ_g, θ_wn) ---
+        # Draws are taken from q(θ|x) = q_g(θ_g|x) · Π_b q_wn(θ_wn_b | x, θ_g)
+        # so log q is a clean sum over the chain-rule terms. The likelihood
+        # is evaluated on the full joint theta = [θ_g, θ_wn_0, ..., θ_wn_{B-1}],
+        # directly comparable to the monolithic IS in the else-branch.
+        global_samples_t, wn_samples_t = model.sample_posterior(batch, n_samples)
+        # global_samples_t: (1, S, 4), wn_samples_t: (1, Bmax, S, 3)
 
-        # 2. Global flow log-prob
-        global_ctx, _ = model._get_contexts(batch)
-        global_ctx_exp = global_ctx.expand(n_samples, -1)
-        theta_norm = model._normalize_global(samples_t.to(device))
-        log_probs_norm = model.global_flow.log_prob(theta_norm.float(), global_ctx_exp.float())
-        log_probs = log_probs_norm - model.global_theta_std.log().sum()
-        log_q_np = log_probs.cpu().numpy().astype(np.float64)
+        # Number of active backends from the simulator
+        n_active = int(sim.theta_wn.shape[0]) if sim.theta_wn is not None else 0
 
-        # 3. Global prior log-prob
-        log_prior_t = prior.global_prior.log_prob(samples_t.cpu())
-        log_prior_np = log_prior_t.numpy().astype(np.float64)
+        # Build full joint theta: [θ_g, θ_wn_0, ..., θ_wn_{n_active-1}] per draw
+        samples_g_np = global_samples_t[0].cpu().numpy().astype(np.float64)  # (S, 4)
+        wn_active_t = wn_samples_t[0, :n_active]  # (n_active, S, 3)
+        # (n_active, S, 3) → (S, n_active*3)
+        wn_active_np = (
+            wn_active_t.permute(1, 0, 2).reshape(n_samples, -1).cpu().numpy().astype(np.float64)
+        )
+        samples_np = np.concatenate([samples_g_np, wn_active_np], axis=-1)
 
-        # 4. Exact likelihood with true WN params fixed (first backend)
-        wn_true = sim.theta_wn[0] if sim.theta_wn is not None else np.zeros(3)
-        # Build 7-D theta_full by appending true first-backend WN to each global sample
-        wn_tile = np.tile(wn_true, (n_samples, 1))  # (S, 3)
-        theta_full = np.concatenate([samples_np, wn_tile], axis=1)  # (S, 7)
-        log_lik = log_likelihood_batch(theta_full, sim, jitter=jitter)
+        # Joint flow log-prob: autoregressive with teacher-forced drawn θ_g
+        global_ctx, wn_ctx = model._get_contexts(batch)  # (1, gctx), (1, Bmax, wctx)
+        g_ctx_exp = global_ctx.expand(n_samples, -1)
+        tg_norm = model._normalize_global(global_samples_t[0].to(device))  # (S, 4)
+        log_q_g_norm = model.global_flow.log_prob(tg_norm.float(), g_ctx_exp.float())
+        log_q_g = log_q_g_norm - model.global_theta_std.log().sum()
+
+        log_q_wn_total = torch.zeros(n_samples, device=device, dtype=torch.float32)
+        for b in range(n_active):
+            w_ctx_b = wn_ctx[0, b].expand(n_samples, -1)  # (S, wctx)
+            w_ctx_b_ar = torch.cat([w_ctx_b, tg_norm], dim=-1)  # (S, wctx+4)
+            tw_norm = model._normalize_wn(wn_samples_t[0, b].to(device))  # (S, 3)
+            log_q_wn_norm = model.wn_flow.log_prob(tw_norm.float(), w_ctx_b_ar.float())
+            log_q_wn_b = log_q_wn_norm - model.wn_theta_std.log().sum()
+            log_q_wn_total = log_q_wn_total + log_q_wn_b
+        log_q_np = (log_q_g + log_q_wn_total).cpu().numpy().astype(np.float64)
+
+        # Joint prior: uniform global * uniform wn per active backend
+        log_prior_g = prior.global_prior.log_prob(global_samples_t[0].cpu())
+        log_prior_wn = torch.zeros(n_samples)
+        for b in range(n_active):
+            log_prior_wn = log_prior_wn + prior.wn_prior.log_prob(wn_samples_t[0, b].cpu())
+        log_prior_np = (log_prior_g + log_prior_wn).numpy().astype(np.float64)
+
+        # Full-joint exact likelihood (log_likelihood_batch dispatches on D=4+3N)
+        log_lik = log_likelihood_batch(samples_np, sim, jitter=jitter)
 
     else:
         # --- Non-factorized model ---

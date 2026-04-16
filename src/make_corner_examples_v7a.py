@@ -1,12 +1,14 @@
-"""Generate v4e corner-plot examples showing the full 7-parameter monolithic posterior.
+"""Generate v7a corner-plot examples showing the full 10-parameter monolithic posterior.
 
-Parameters:  (log10_A_red, gamma_red, log10_A_dm, gamma_dm, EFAC, log10_EQUAD, log10_ECORR)
+Parameters:  (log10_A_red, gamma_red, log10_A_dm, gamma_dm,
+              EFAC_0, log10_EQUAD_0, log10_ECORR_0,
+              EFAC_1, log10_EQUAD_1, log10_ECORR_1)
 
 IS correction is applied:
   log w = log p(x|θ) + log π(θ) - log q(θ|x)
 
 Usage:
-    conda run -n pta-transformer-sbi python3 -m src.make_corner_examples_v4e
+    conda run -n pta-transformer-sbi python3 -m src.make_corner_examples_v7a
 """
 
 from __future__ import annotations
@@ -38,48 +40,56 @@ from src.importance_sampling import (
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-CHECKPOINT = "outputs/v4e/transformer/best_model.pt"
-CONFIG = "configs/transformer_v4e.yaml"
-OUT_DIR = "outputs/v4e/eval/corner_examples"
+CHECKPOINT = "outputs/v7a/transformer/best_model.pt"
+CONFIG = "configs/transformer_v7a.yaml"
+OUT_DIR = "outputs/v7a/eval/corner_examples"
 N_SAMPLES = 100_000  # flow proposal samples
 N_RESAMPLE = 5_000   # IS resampled particles for display
 N_EXAMPLES = 10
 JITTER = 1e-20
-
-PARAM_LABELS = [
-    r"$\log_{10} A_\mathrm{red}$",
-    r"$\gamma_\mathrm{red}$",
-    r"$\log_{10} A_\mathrm{DM}$",
-    r"$\gamma_\mathrm{DM}$",
-    "EFAC",
-    r"$\log_{10}$ EQUAD",
-    r"$\log_{10}$ ECORR",
-]
 
 PARAM_NAMES = [
     "log10_A_red",
     "gamma_red",
     "log10_A_dm",
     "gamma_dm",
-    "EFAC",
-    "log10_EQUAD",
-    "log10_ECORR",
+    "EFAC_0",
+    "log10_EQUAD_0",
+    "log10_ECORR_0",
+    "EFAC_1",
+    "log10_EQUAD_1",
+    "log10_ECORR_1",
 ]
 
-# Fixed test cases: 7D theta vectors
-# [log10_A_red, gamma_red, log10_A_dm, gamma_dm, EFAC, log10_EQUAD, log10_ECORR]
+PARAM_LABELS = [
+    r"$\log_{10} A_\mathrm{red}$",
+    r"$\gamma_\mathrm{red}$",
+    r"$\log_{10} A_\mathrm{DM}$",
+    r"$\gamma_\mathrm{DM}$",
+    r"EFAC$_0$",
+    r"$\log_{10}$ EQUAD$_0$",
+    r"$\log_{10}$ ECORR$_0$",
+    r"EFAC$_1$",
+    r"$\log_{10}$ EQUAD$_1$",
+    r"$\log_{10}$ ECORR$_1$",
+]
+
+# Fixed test cases: 10D theta vectors
+# [log10_A_red, gamma_red, log10_A_dm, gamma_dm,
+#  EFAC_0, log10_EQUAD_0, log10_ECORR_0,
+#  EFAC_1, log10_EQUAD_1, log10_ECORR_1]
 FIXED_CASES = [
-    # Corners of the red-noise space
-    ([-16.0, 2.0, -14.5, 3.5, 1.0, -6.5, -6.5], "weak-red flat-spec"),
-    ([-12.0, 2.0, -14.5, 3.5, 1.0, -6.5, -6.5], "strong-red flat-spec"),
-    ([-16.0, 5.5, -14.5, 3.5, 1.0, -6.5, -6.5], "weak-red steep-spec"),
-    ([-12.0, 5.5, -14.5, 3.5, 1.0, -6.5, -6.5], "strong-red steep-spec"),
+    # Corners of the red-noise space (mid WN for both backends)
+    ([-16.0, 2.0, -14.5, 3.5, 1.0, -6.5, -6.5, 1.0, -6.5, -6.5], "weak-red flat-spec"),
+    ([-12.0, 2.0, -14.5, 3.5, 1.0, -6.5, -6.5, 1.0, -6.5, -6.5], "strong-red flat-spec"),
+    ([-16.0, 5.5, -14.5, 3.5, 1.0, -6.5, -6.5, 1.0, -6.5, -6.5], "weak-red steep-spec"),
+    ([-12.0, 5.5, -14.5, 3.5, 1.0, -6.5, -6.5, 1.0, -6.5, -6.5], "strong-red steep-spec"),
     # Strong DM
-    ([-14.0, 3.5, -12.0, 4.0, 1.0, -6.5, -6.5], "strong-DM"),
-    # High WN (EFAC near upper prior bound)
-    ([-14.0, 3.5, -14.5, 3.5, 1.8, -5.5, -6.0], "high-WN"),
-    # Low WN (EFAC near lower prior bound)
-    ([-14.0, 3.5, -14.5, 3.5, 0.6, -7.5, -7.5], "low-WN"),
+    ([-14.0, 3.5, -12.0, 4.0, 1.0, -6.5, -6.5, 1.0, -6.5, -6.5], "strong-DM"),
+    # Asymmetric WN: backend 0 noisy, backend 1 quiet
+    ([-14.0, 3.5, -14.5, 3.5, 1.8, -5.5, -6.0, 0.6, -7.5, -7.5], "asym-WN"),
+    # Both backends noisy
+    ([-14.0, 3.5, -14.5, 3.5, 1.8, -5.5, -5.5, 1.7, -5.5, -5.5], "high-WN"),
     # Mid-prior random examples
     None,
     None,
@@ -106,18 +116,17 @@ def make_batch(sim, device="cpu"):
 
 @torch.no_grad()
 def monolithic_samples_and_is(model, batch, sim, prior, n_samples, jitter, device):
-    """Sample from monolithic 7D flow and compute IS weights.
+    """Sample from monolithic 10D flow and compute IS weights.
 
     Returns
     -------
-    flat_samples  (N, 7)   flow proposal samples
-    is_samples    (M, 7)   IS-resampled particles
+    flat_samples  (N, 10)  flow proposal samples
+    is_samples    (M, 10)  IS-resampled particles
     ess           float
     ess_frac      float
     """
-    # Sample from 7D flow
-    samples = model.sample_posterior(batch, n_samples=n_samples)  # (1, N, 7)
-    samples = samples[0]  # (N, 7)
+    samples = model.sample_posterior(batch, n_samples=n_samples)  # (1, N, 10)
+    samples = samples[0]  # (N, 10)
     flat_np = samples.cpu().numpy().astype(np.float64)
 
     # log q(θ|x) via flow
@@ -131,7 +140,7 @@ def monolithic_samples_and_is(model, batch, sim, prior, n_samples, jitter, devic
     # log π(θ) — uniform prior
     log_pi = prior.log_prob(samples.cpu()).numpy().astype(np.float64)
 
-    # log p(x|θ) — exact likelihood
+    # log p(x|θ) — exact likelihood (handles per-backend WN via D=10)
     log_lik = log_likelihood_batch(flat_np, sim, jitter=jitter)
 
     # IS weights
@@ -164,8 +173,8 @@ def make_corner(
     ess=0.0,
     ess_frac=0.0,
 ):
-    """Plot a 7×7 corner with flow (blue) and IS-corrected (red) samples."""
-    fig = plt.figure(figsize=(14, 14))
+    """Plot a 10×10 corner with flow (blue) and IS-corrected (red) samples."""
+    fig = plt.figure(figsize=(20, 20))
 
     ranges = [tuple(prior_bounds[k]) for k in PARAM_NAMES]
 
@@ -173,9 +182,9 @@ def make_corner(
         labels=PARAM_LABELS,
         range=ranges,
         show_titles=False,
-        title_kwargs={"fontsize": 9},
-        label_kwargs={"fontsize": 9},
-        tick_kwargs={"labelsize": 7},
+        title_kwargs={"fontsize": 8},
+        label_kwargs={"fontsize": 8},
+        tick_kwargs={"labelsize": 5},
         plot_contours=True,
         smooth=1.0,
         bins=35,
@@ -189,7 +198,7 @@ def make_corner(
         color="royalblue",
         alpha=0.4,
         contourf_kwargs={"alpha": 0.25},
-        contour_kwargs={"linewidths": 0.8},
+        contour_kwargs={"linewidths": 0.6},
         hist_kwargs={"alpha": 0.4},
         **common_kw,
     )
@@ -200,30 +209,27 @@ def make_corner(
         color="crimson",
         alpha=0.7,
         contourf_kwargs={"alpha": 0.0},
-        contour_kwargs={"linewidths": 1.2},
-        hist_kwargs={"alpha": 0.0, "histtype": "step", "linewidth": 1.2},
+        contour_kwargs={"linewidths": 1.0},
+        hist_kwargs={"alpha": 0.0, "histtype": "step", "linewidth": 1.0},
         **common_kw,
     )
 
     # Truth
-    corner.overplot_lines(fig, true_theta, color="seagreen", lw=1.2)
+    corner.overplot_lines(fig, true_theta, color="seagreen", lw=1.0)
     corner.overplot_points(
-        fig, true_theta[None], marker="*", color="seagreen", ms=6, zorder=5
+        fig, true_theta[None], marker="*", color="seagreen", ms=5, zorder=5
     )
 
     # Title
-    a_red = true_theta[0]
-    g_red = true_theta[1]
-    a_dm = true_theta[2]
-    g_dm = true_theta[3]
-    efac = true_theta[4]
-    equad = true_theta[5]
-    ecorr = true_theta[6]
     title = (
-        f"Example {example_idx:02d}  |  {label}  |  ESS={ess:.0f} ({ess_frac*100:.1f}%)\n"
-        f"A_red={a_red:.2f}, γ_red={g_red:.2f},  "
-        f"A_dm={a_dm:.2f}, γ_dm={g_dm:.2f},  "
-        f"EFAC={efac:.2f}, EQUAD={equad:.2f}, ECORR={ecorr:.2f}"
+        f"Example {example_idx:02d}  |  {label}  |  "
+        f"ESS={ess:.0f} ({ess_frac * 100:.1f}%)\n"
+        f"A_red={true_theta[0]:.2f}, γ_red={true_theta[1]:.2f}, "
+        f"A_dm={true_theta[2]:.2f}, γ_dm={true_theta[3]:.2f}\n"
+        f"EFAC₀={true_theta[4]:.2f}, EQ₀={true_theta[5]:.2f}, "
+        f"EC₀={true_theta[6]:.2f}  |  "
+        f"EFAC₁={true_theta[7]:.2f}, EQ₁={true_theta[8]:.2f}, "
+        f"EC₁={true_theta[9]:.2f}"
     )
 
     from matplotlib.patches import Patch
@@ -253,7 +259,6 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # Build prior (monolithic UniformPrior)
     prior_cfg = cfg["prior"]
     prior = UniformPrior(prior_cfg)
 
@@ -266,32 +271,33 @@ def main():
 
     out_dir = ensure_dir(OUT_DIR)
     data_cfg = cfg["data"]
+    n_backends = data_cfg.get("n_backends_fixed", 2)
 
     for idx in range(N_EXAMPLES):
         case = FIXED_CASES[idx]
         rng = np.random.default_rng(1000 + idx)
 
         if case is None:
-            # Random draw from prior
             theta = prior.sample(1, rng=rng).squeeze(0).numpy()
             label = "random"
         else:
             theta_list, label = case
             theta = np.array(theta_list, dtype=np.float32)
 
-        # Generate schedule and simulate
+        # Generate schedule with 2 fixed backends and simulate
         sched = generate_schedule(
             rng,
             tspan_min_yr=data_cfg.get("tspan_min_yr", 5.0),
             tspan_max_yr=data_cfg.get("tspan_max_yr", 15.0),
             n_toa_min=data_cfg.get("n_toa_min", 80),
             n_toa_max=data_cfg.get("n_toa_max", 400),
+            n_backends_fixed=n_backends,
         )
         sim = simulate_pulsar(
             theta, sched, n_modes=data_cfg.get("n_fourier_modes", 30), rng=rng
         )
 
-        true_theta = sim.theta  # (7,)
+        true_theta = sim.theta  # (10,)
         batch = make_batch(sim, device=str(device))
 
         print(
@@ -304,7 +310,7 @@ def main():
             model, batch, sim, prior, N_SAMPLES, JITTER, device
         )
 
-        print(f"  ESS = {ess:.0f} / {N_SAMPLES} ({ess_frac*100:.1f}%)")
+        print(f"  ESS = {ess:.0f} / {N_SAMPLES} ({ess_frac * 100:.1f}%)")
 
         out_path = os.path.join(out_dir, f"corner_example_{idx:02d}.png")
         make_corner(

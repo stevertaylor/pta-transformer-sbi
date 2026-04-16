@@ -10,6 +10,7 @@ from src.priors import UniformPrior, FactorizedPrior
 from src.dataset import PulsarDataset, FixedPulsarDataset
 from src.collate import collate_fn
 from src.models.model_wrappers import build_model, FactorizedNPEModel
+from src.models.tokenization import N_CONTINUOUS_FEATURES
 
 
 # ---- Fixtures ----
@@ -74,7 +75,7 @@ def factorized_prior():
     )
 
 
-def _make_factorized_batch(B=4, L_max=50, n_feat=6, n_backends_max=4):
+def _make_factorized_batch(B=4, L_max=50, n_feat=N_CONTINUOUS_FEATURES, n_backends_max=4):
     """Create a dummy factorized batch."""
     seq_lens = torch.randint(10, L_max, (B,))
     features = torch.randn(B, L_max, n_feat)
@@ -428,7 +429,7 @@ def test_standard_model_still_works():
         mask[i, : seq_lens[i]] = True
     batch = {
         "theta": torch.randn(4, 2),
-        "features": torch.randn(4, 50, 6),
+        "features": torch.randn(4, 50, N_CONTINUOUS_FEATURES),
         "backend_id": torch.zeros(4, 50, dtype=torch.long),
         "mask": mask,
         "seq_lens": seq_lens,
@@ -436,3 +437,137 @@ def test_standard_model_still_works():
     }
     loss = model(batch)
     assert torch.isfinite(loss)
+
+
+# ---- Autoregressive wiring checks (v7c) ----
+
+
+def test_factorized_wn_context_includes_theta_g(v5_cfg):
+    """Autoregressive model stores theta_g_dim and can forward/backward."""
+    model = build_model("transformer", v5_cfg)
+    assert model.theta_g_dim == 4
+    batch = _make_factorized_batch(B=2)
+    loss = model(batch)
+    assert torch.isfinite(loss)
+
+
+def test_factorized_wn_conditional_on_theta_g(v5_cfg):
+    """Changing teacher-forced θ_g must change the WN log-prob term."""
+    torch.manual_seed(0)
+    model = build_model("transformer", v5_cfg)
+    model.eval()
+    batch = _make_factorized_batch(B=2)
+    batch_a = dict(batch)
+    batch_b = dict(batch)
+    batch_b["theta_global"] = batch["theta_global"] + 5.0
+    with torch.no_grad():
+        model(batch_a)
+        lw_a = model._last_wn_loss
+        model(batch_b)
+        lw_b = model._last_wn_loss
+    assert abs(lw_a - lw_b) > 1e-4, (
+        f"WN loss unchanged under θ_g change: {lw_a} vs {lw_b} — "
+        "autoregressive conditioning is not wired in."
+    )
+
+
+def test_factorized_sample_joint_alignment(v5_cfg):
+    """Joint samples return paired (θ_g_i, θ_wn_b,i) draws."""
+    model = build_model("transformer", v5_cfg)
+    model.eval()
+    batch = _make_factorized_batch(B=1)
+    gs, ws = model.sample_posterior(batch, n_samples=128)
+    assert gs.shape == (1, 128, 4)
+    assert ws.shape == (1, 4, 128, 3)
+    assert torch.all(torch.isfinite(gs)) and torch.all(torch.isfinite(ws))
+
+
+def test_v7c_config_builds():
+    """The v7c config builds a valid autoregressive factorized model."""
+    import yaml
+    import os
+
+    cfg_path = os.path.join(
+        os.path.dirname(__file__), "..", "configs", "transformer_v7c.yaml"
+    )
+    with open(cfg_path) as f:
+        cfg = yaml.safe_load(f)
+    model = build_model("transformer", cfg)
+    assert isinstance(model, FactorizedNPEModel)
+    assert model.theta_g_dim == 4
+    batch = _make_factorized_batch(B=2, n_backends_max=cfg["model"]["n_backends_max"])
+    loss = model(batch)
+    assert torch.isfinite(loss)
+
+
+def test_v7c2_config_builds_with_noise():
+    """v7c2 config wires teacher-signal noise into the model."""
+    import yaml
+    import os
+
+    cfg_path = os.path.join(
+        os.path.dirname(__file__), "..", "configs", "transformer_v7c2.yaml"
+    )
+    with open(cfg_path) as f:
+        cfg = yaml.safe_load(f)
+    model = build_model("transformer", cfg)
+    assert isinstance(model, FactorizedNPEModel)
+    assert model.theta_g_noise_std == pytest.approx(cfg["model"]["theta_g_noise"])
+    assert model.theta_g_noise_std > 0.0
+    batch = _make_factorized_batch(B=2, n_backends_max=cfg["model"]["n_backends_max"])
+    loss = model(batch)
+    assert torch.isfinite(loss)
+
+
+def test_theta_g_noise_train_only(v5_cfg):
+    """Noise perturbs WN loss in training mode and is a no-op at eval."""
+    cfg = {**v5_cfg}
+    cfg["model"] = {**v5_cfg["model"], "theta_g_noise": 0.1}
+    torch.manual_seed(0)
+    model = build_model("transformer", cfg)
+    assert model.theta_g_noise_std == pytest.approx(0.1)
+    batch = _make_factorized_batch(B=4)
+
+    # Eval mode: two forward passes must be identical (noise is disabled).
+    model.eval()
+    torch.manual_seed(1)
+    with torch.no_grad():
+        model(batch)
+        lw_eval_a = model._last_wn_loss
+        torch.manual_seed(2)
+        model(batch)
+        lw_eval_b = model._last_wn_loss
+    assert lw_eval_a == lw_eval_b, (
+        f"Eval-mode noise must be a no-op: {lw_eval_a} vs {lw_eval_b}"
+    )
+
+    # Train mode: two passes with different seeds draw different noise and
+    # must produce different WN losses on the same batch.
+    model.train()
+    torch.manual_seed(1)
+    loss1 = model(batch)
+    lw_train_a = model._last_wn_loss
+    torch.manual_seed(2)
+    loss2 = model(batch)
+    lw_train_b = model._last_wn_loss
+    assert torch.isfinite(loss1) and torch.isfinite(loss2)
+    assert abs(lw_train_a - lw_train_b) > 1e-6, (
+        f"Train-mode noise must perturb WN loss: {lw_train_a} vs {lw_train_b}"
+    )
+
+
+def test_theta_g_noise_zero_is_deterministic(v5_cfg):
+    """With noise=0 (default), train and eval give identical WN losses."""
+    torch.manual_seed(0)
+    model = build_model("transformer", v5_cfg)
+    assert model.theta_g_noise_std == 0.0
+    batch = _make_factorized_batch(B=2)
+    model.train()
+    with torch.no_grad():
+        model(batch)
+        lw_train = model._last_wn_loss
+    model.eval()
+    with torch.no_grad():
+        model(batch)
+        lw_eval = model._last_wn_loss
+    assert lw_train == lw_eval

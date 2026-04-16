@@ -1,0 +1,89 @@
+# v7b config – monolithic 10D with 2 fixed backends, scaled-up flow
+# Changes from v7a (which used identical architecture to v4e):
+#   1. flow_transforms: 10 → 16  — more coupling layers for 10D correlations
+#   2. flow_hidden: 256 → 384    — wider MLPs in each coupling layer
+#   3. flow_bins: 16 → 24        — finer spline resolution for sharp ridges
+#   4. train_samples: 500k → 1M  — 10D prior volume needs more coverage
+#   5. lr: 5e-4 → 3e-4           — reduce val loss noise (was ±0.2 nats in v7a)
+#   6. patience: 40 → 60         — allow longer convergence with lower LR
+#   7. epochs: 200 → 300         — budget for slower LR
+#
+# Diagnosis from v7a: marginal KS is good (0.072, better than v4e's 0.083)
+# but ESS collapsed (< 10) for 20% of test cases. Corner plots show the flow
+# can't capture 10D joint correlations — especially WN-red noise ridges near
+# prior boundaries. The fix is flow capacity + data volume + training stability.
+#
+# v7a: H=0.472, KS=0.072, ESS=8.2% (8.0M params, best epoch 64)
+# Target: H<0.30, ESS>20%, zero collapsed cases (ESS>50 for all)
+data:
+  train_samples: 1000000
+  val_samples: 10000
+  test_samples: 5000
+  n_fourier_modes: 30
+  n_toa_min: 80
+  n_toa_max: 400
+  tspan_min_yr: 5.0
+  tspan_max_yr: 15.0
+  jitter: 1.0e-20
+  use_sobol: true
+  reseed_per_epoch: true
+  n_backends_fixed: 2
+
+prior:
+  log10_A_red: [-17, -11]
+  gamma_red: [1.0, 7.0]
+  log10_A_dm: [-17, -11]
+  gamma_dm: [1.0, 7.0]
+  EFAC_0: [0.5, 2.0]
+  log10_EQUAD_0: [-8, -5]
+  log10_ECORR_0: [-8, -5]
+  EFAC_1: [0.5, 2.0]
+  log10_EQUAD_1: [-8, -5]
+  log10_ECORR_1: [-8, -5]
+
+model:
+  # Transformer encoder (unchanged from v4e/v7a)
+  d_model: 256
+  nhead: 8
+  num_layers: 6
+  dim_feedforward: 1024
+  dropout: 0.05
+  context_dim: 128
+  use_rope: true
+  use_aux_features: true
+
+  # LSTM (shared config key, unused for transformer)
+  lstm_hidden: 256
+  lstm_layers: 3
+
+  # Normalizing flow — scaled up for 10D
+  flow_transforms: 16
+  flow_hidden: 384
+  flow_layers: 3
+  flow_bins: 24
+
+training:
+  epochs: 300
+  batch_size: 256
+  lr: 3.0e-4
+  weight_decay: 5.0e-4
+  flow_weight_decay: 2.0e-3
+  grad_clip: 5.0
+  patience: 60
+  seed: 42
+  warmup_fraction: 0.05
+  use_amp: true
+  num_workers: 4
+  ema_alpha: 0.15
+
+eval:
+  n_grid: 200
+  n_posterior_samples: 10000
+  n_test_exact: 100
+  masking_levels: [0.0, 0.15, 0.3, 0.45, 0.6]
+  importance_sampling:
+    enabled: true
+    n_samples: 10000
+    n_examples: 50
+
+output_dir: outputs/v7b_ecorr

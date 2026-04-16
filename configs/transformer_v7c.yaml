@@ -1,0 +1,113 @@
+# v7c — autoregressive factorized NPE
+#
+# Posterior: q(θ|x) = q_g(θ_g | x) · Π_b q_wn(θ_wn_b | x, θ_g)
+# This is the correct chain-rule decomposition; no independence assumption.
+# It reintroduces the WN ↔ red-noise coupling that v5/v6 dropped and that
+# v7b's 15% structural tail (ESS<10 at high log10_ECORR) is known to need.
+#
+# Lessons carried forward:
+#   v4e  — solid 7D monolithic (N=1):    H=0.19, ESS=36%
+#   v5   — factorized WN flow works;     global collapsed (KS=0.176)
+#   v6   — no regularization → catastrophic overfitting (13+ nat gap)
+#   v6c  — 96D bottleneck + wn_loss_weight=1.0 stabilized (not enough alone)
+#   v7b  — 10D monolithic, scaled capacity: 15% collapsed tail persists
+#   v7b_ecorr — +2 TOAs/epoch fix: val loss -2.46, but tail 7/50 → 15/50
+#                because coupling NSF cannot represent WN↔red coupling
+#                at prior boundaries on the joint.
+#
+# Hyperparameter sources:
+#   global flow      10×256×3×16        (v6c — 4D, plenty)
+#   wn flow           6×128×2×8         (v5 — worked, don't oversize)
+#   global bottleneck   96D             (v6c — not too aggressive)
+#   wn bottleneck       96D             (v6c; θ_g pass-through on top)
+#   encoder          v7b transformer trunk unchanged
+#   wn_loss_weight   1.0                (v6c; not v5's 0.3)
+#   dropout          0.1                (v6 lesson: 6-layer enc needs it)
+#   priors           v7b_ecorr (gamma [1,7])
+#   data             1M train, 2 backends fixed, ≥2 TOAs/epoch (ECORR ID-able)
+
+data:
+  train_samples: 1000000
+  val_samples: 10000
+  test_samples: 5000
+  n_fourier_modes: 30
+  n_toa_min: 80
+  n_toa_max: 400
+  tspan_min_yr: 5.0
+  tspan_max_yr: 15.0
+  jitter: 1.0e-20
+  use_sobol: true
+  reseed_per_epoch: true
+  n_backends_fixed: 2
+
+prior:
+  global:
+    log10_A_red: [-17, -11]
+    gamma_red: [1.0, 7.0]
+    log10_A_dm: [-17, -11]
+    gamma_dm: [1.0, 7.0]
+  white_noise:
+    EFAC: [0.5, 2.0]
+    log10_EQUAD: [-8, -5]
+    log10_ECORR: [-8, -5]
+
+model:
+  factorized: true
+  n_backends_max: 2
+  context_dropout: 0.0
+  wn_loss_weight: 1.0
+  global_context_proj_dim: 96
+  wn_context_proj_dim: 96
+
+  # Transformer encoder (v7b trunk; dropout 0.05 → 0.1 per v6 lesson)
+  d_model: 256
+  nhead: 8
+  num_layers: 6
+  dim_feedforward: 1024
+  dropout: 0.1
+  context_dim: 128
+  use_rope: true
+  use_aux_features: true
+
+  # LSTM (shared config keys, unused for transformer)
+  lstm_hidden: 256
+  lstm_layers: 3
+
+  # Global flow (4D) — v6c sizing; autoregressive conditioning provides
+  # the implicit regularization v5's 4D flow lacked.
+  global_flow_transforms: 10
+  global_flow_hidden: 256
+  global_flow_layers: 3
+  global_flow_bins: 16
+
+  # WN flow (3D), conditioned on (x_b, θ_g) — v5 sizing (worked).
+  wn_flow_transforms: 6
+  wn_flow_hidden: 128
+  wn_flow_layers: 2
+  wn_flow_bins: 8
+
+training:
+  epochs: 300
+  batch_size: 256
+  lr: 3.0e-4
+  weight_decay: 5.0e-4
+  flow_weight_decay: 2.0e-3
+  grad_clip: 5.0
+  patience: 60
+  seed: 42
+  warmup_fraction: 0.05
+  use_amp: true
+  num_workers: 4
+  ema_alpha: 0.15
+
+eval:
+  n_grid: 200
+  n_posterior_samples: 10000
+  n_test_exact: 100
+  masking_levels: [0.0, 0.15, 0.3, 0.45, 0.6]
+  importance_sampling:
+    enabled: true
+    n_samples: 10000
+    n_examples: 50
+
+output_dir: outputs/v7c

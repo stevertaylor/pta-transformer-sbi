@@ -194,14 +194,16 @@ def _build_standard_model(model_type: str, cfg: dict) -> NPEModel:
 
 
 class FactorizedNPEModel(nn.Module):
-    """Factorized amortized NPE: separate global and per-backend flows.
+    """Autoregressive factorized amortized NPE.
 
-    Loss = -log q_global(θ_global|c_global) - mean_b log q_wn(θ_wn_b|c_b)
+    Posterior decomposition:
+        q(θ | x) = q_global(θ_g | x) · ∏_b q_wn(θ_wn_b | x, θ_g)
 
-    This factorizes the 4+3B-dimensional posterior into a 4-D global flow
-    and a shared 3-D per-backend white-noise flow, enabling:
-    - Better EFAC/EQUAD/ECORR calibration (low-D flow, backend-specific context)
-    - Variable number of backends per pulsar (real PTA data ready)
+    The per-backend WN flow is conditioned on the global parameters θ_g
+    (teacher-forced at train time, auto-regressively drawn at inference),
+    which captures the WN ↔ red-noise coupling that an independence
+    factorization drops. Loss is the negative log joint under this chain
+    rule; no independence assumption is made.
     """
 
     def __init__(
@@ -221,6 +223,8 @@ class FactorizedNPEModel(nn.Module):
         global_context_proj_dim: int | None = None,
         wn_context_raw_dim: int | None = None,
         wn_context_proj_dim: int | None = None,
+        theta_g_dim: int = 4,
+        theta_g_noise_std: float = 0.0,
     ):
         super().__init__()
         self.encoder = encoder
@@ -229,6 +233,11 @@ class FactorizedNPEModel(nn.Module):
         self.use_aux = use_aux
         self.n_backends_max = n_backends_max
         self.wn_loss_weight = wn_loss_weight
+        self.theta_g_dim = theta_g_dim
+        # Small Gaussian noise on teacher-forced θ_g (normalized space) in the
+        # WN branch only. Training-only, closes the gap to q_g(·|x) at inference
+        # and prevents the WN flow from collapsing onto exact θ_g coordinates.
+        self.theta_g_noise_std = theta_g_noise_std
         self.ctx_dropout = nn.Dropout(context_dropout) if context_dropout > 0 else None
 
         # Optional bottleneck to compress global context before the flow
@@ -352,10 +361,12 @@ class FactorizedNPEModel(nn.Module):
         return global_ctx, wn_ctx
 
     def forward(self, batch: dict) -> torch.Tensor:
-        """Compute factorized negative log-prob loss.
+        """Compute autoregressive factorized negative log-prob loss.
 
-        Returns scalar loss = -mean[log q_global] - w * mean[log q_wn (over active backends)].
-        Also stores self._last_global_loss and self._last_wn_loss for logging.
+        log q(θ|x) = log q_global(θ_g|x) + Σ_b log q_wn(θ_wn_b | x, θ_g)
+
+        θ_g is teacher-forced from the simulator ground truth.
+        Returns: loss = -E[log q_global] - w * E_active[log q_wn]
         """
         global_ctx, wn_ctx = self._get_contexts(batch)
 
@@ -371,17 +382,25 @@ class FactorizedNPEModel(nn.Module):
             global_lp = self.global_flow.log_prob(tg_norm.float(), global_ctx.float())
         global_loss = -global_lp.mean()
 
-        # Per-backend WN flow loss
+        # Per-backend WN flow loss: condition WN context on teacher-forced θ_g.
+        # At training only, optionally perturb the teacher signal with small
+        # Gaussian noise — keeps the chain-rule loss an unbiased estimator of
+        # the smoothed conditional and stops the flow locking onto exact
+        # θ_g coordinates (see v7c catastrophic overfit).
+        tg_for_wn = tg_norm
+        if self.training and self.theta_g_noise_std > 0.0:
+            tg_for_wn = tg_norm + self.theta_g_noise_std * torch.randn_like(tg_norm)
+        tg_exp = tg_for_wn.unsqueeze(1).expand(-1, self.n_backends_max, -1)  # (B, Bmax, 4)
+        wn_ctx_ar = torch.cat([wn_ctx, tg_exp], dim=-1)  # (B, Bmax, wn_ctx+4)
+
         theta_wn = batch["theta_wn"]  # (B, Bmax, 3)
         backend_active = batch["backend_active"]  # (B, Bmax) bool
-
-        # Flatten active pairs
-        active_mask = backend_active  # (B, Bmax)
+        active_mask = backend_active
         n_active = active_mask.sum()
         if n_active > 0:
             tw_norm = self._normalize_wn(theta_wn)  # (B, Bmax, 3)
             tw_flat = tw_norm[active_mask]  # (n_active, 3)
-            wn_ctx_flat = wn_ctx[active_mask]  # (n_active, wn_context_dim)
+            wn_ctx_flat = wn_ctx_ar[active_mask]  # (n_active, wn_ctx+4)
             with torch.autocast(wn_ctx_flat.device.type, enabled=False):
                 wn_lp = self.wn_flow.log_prob(tw_flat.float(), wn_ctx_flat.float())
             wn_loss = -wn_lp.mean()
@@ -396,27 +415,34 @@ class FactorizedNPEModel(nn.Module):
 
     @torch.no_grad()
     def sample_posterior(self, batch: dict, n_samples: int = 1000):
-        """Sample from factorized posterior.
+        """Autoregressively sample from q(θ|x).
+
+        Draw θ_g ~ q_global(·|x), then per backend draw θ_wn_b ~ q_wn(·|x, θ_g)
+        so the i-th global sample and the i-th WN sample form a joint draw.
 
         Returns
         -------
         global_samples : (B, n_samples, 4)
-        wn_samples : (B, n_backends_max, n_samples, 3)
+        wn_samples     : (B, n_backends_max, n_samples, 3) — index i aligned
+                         with global_samples[:, i] (same joint draw).
         """
         global_ctx, wn_ctx = self._get_contexts(batch)
         B = global_ctx.shape[0]
+        Bmax = self.n_backends_max
+        S = n_samples
 
         # Global samples
-        gs_norm = self.global_flow.sample(global_ctx, n_samples)  # (B, S, 4)
+        gs_norm = self.global_flow.sample(global_ctx, S)  # (B, S, 4)
         global_samples = self._denormalize_global(gs_norm)
 
-        # Per-backend WN samples
-        wn_samples_list = []
-        for b in range(self.n_backends_max):
-            ctx_b = wn_ctx[:, b, :]  # (B, wn_ctx_dim)
-            ws_norm = self.wn_flow.sample(ctx_b, n_samples)  # (B, S, 3)
-            wn_samples_list.append(self._denormalize_wn(ws_norm))
-        wn_samples = torch.stack(wn_samples_list, dim=1)  # (B, Bmax, S, 3)
+        # Expand θ_g and wn_ctx to (B, Bmax, S, .) then cat + flatten for batched flow call
+        gs_norm_exp = gs_norm.unsqueeze(1).expand(B, Bmax, S, -1)  # (B, Bmax, S, 4)
+        wn_ctx_exp = wn_ctx.unsqueeze(2).expand(B, Bmax, S, -1)  # (B, Bmax, S, wctx)
+        wn_ctx_ar = torch.cat([wn_ctx_exp, gs_norm_exp], dim=-1)
+        wn_ctx_flat = wn_ctx_ar.reshape(B * Bmax * S, -1)
+        ws_norm_flat = self.wn_flow.sample(wn_ctx_flat, 1).squeeze(1)  # (B*Bmax*S, 3)
+        ws_norm = ws_norm_flat.reshape(B, Bmax, S, 3)
+        wn_samples = self._denormalize_wn(ws_norm)
 
         return global_samples, wn_samples
 
@@ -443,14 +469,8 @@ def _build_factorized_model(model_type: str, cfg: dict) -> FactorizedNPEModel:
     global_flow_ctx_raw = context_dim + (N_AUX_FEATURES if use_aux else 0)
     global_ctx_proj_dim = mcfg.get("global_context_proj_dim", None)
     global_flow_ctx = global_ctx_proj_dim if global_ctx_proj_dim else global_flow_ctx_raw
-    # WN flow context dim: global_ctx + backend_ctx + backend_aux
-    wn_flow_ctx_raw = (
-        global_flow_ctx_raw + context_dim + (N_BACKEND_AUX_FEATURES if use_aux else 0)
-    )
-    wn_ctx_proj_dim = mcfg.get("wn_context_proj_dim", None)
-    wn_flow_ctx = wn_ctx_proj_dim if wn_ctx_proj_dim else wn_flow_ctx_raw
 
-    # Prior bounds for normalization
+    # Prior bounds for normalization (needed before we size the WN flow)
     global_cfg = cfg.get("prior", {}).get("global", {})
     wn_cfg = cfg.get("prior", {}).get("white_noise", {})
 
@@ -459,6 +479,15 @@ def _build_factorized_model(model_type: str, cfg: dict) -> FactorizedNPEModel:
     g_hi = torch.tensor([global_cfg[k][1] for k in g_names], dtype=torch.float32)
     global_theta_mean = (g_lo + g_hi) / 2
     global_theta_std = (g_hi - g_lo) / 2
+
+    # WN flow context dim: encoder-derived context (optionally bottlenecked)
+    # plus θ_g (autoregressive conditioning, pass-through — not bottlenecked).
+    theta_g_dim = len(g_names)
+    wn_flow_ctx_raw = (
+        global_flow_ctx_raw + context_dim + (N_BACKEND_AUX_FEATURES if use_aux else 0)
+    )
+    wn_ctx_proj_dim = mcfg.get("wn_context_proj_dim", None)
+    wn_flow_ctx = (wn_ctx_proj_dim if wn_ctx_proj_dim else wn_flow_ctx_raw) + theta_g_dim
 
     w_names = list(wn_cfg.keys())
     w_lo = torch.tensor([wn_cfg[k][0] for k in w_names], dtype=torch.float32)
@@ -528,4 +557,6 @@ def _build_factorized_model(model_type: str, cfg: dict) -> FactorizedNPEModel:
         global_context_proj_dim=global_ctx_proj_dim,
         wn_context_raw_dim=wn_flow_ctx_raw if wn_ctx_proj_dim else None,
         wn_context_proj_dim=wn_ctx_proj_dim,
+        theta_g_dim=theta_g_dim,
+        theta_g_noise_std=mcfg.get("theta_g_noise", 0.0),
     )
