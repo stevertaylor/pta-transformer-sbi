@@ -235,10 +235,14 @@ def importance_sample(
         log_q_g_norm = model.global_flow.log_prob(tg_norm.float(), g_ctx_exp.float())
         log_q_g = log_q_g_norm - model.global_theta_std.log().sum()
 
+        chain_rule = getattr(model, "chain_rule", True)
         log_q_wn_total = torch.zeros(n_samples, device=device, dtype=torch.float32)
         for b in range(n_active):
             w_ctx_b = wn_ctx[0, b].expand(n_samples, -1)  # (S, wctx)
-            w_ctx_b_ar = torch.cat([w_ctx_b, tg_norm], dim=-1)  # (S, wctx+4)
+            if chain_rule:
+                w_ctx_b_ar = torch.cat([w_ctx_b, tg_norm], dim=-1)  # (S, wctx+4)
+            else:
+                w_ctx_b_ar = w_ctx_b
             tw_norm = model._normalize_wn(wn_samples_t[0, b].to(device))  # (S, 3)
             log_q_wn_norm = model.wn_flow.log_prob(tw_norm.float(), w_ctx_b_ar.float())
             log_q_wn_b = log_q_wn_norm - model.wn_theta_std.log().sum()

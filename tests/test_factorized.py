@@ -571,3 +571,58 @@ def test_theta_g_noise_zero_is_deterministic(v5_cfg):
         model(batch)
         lw_eval = model._last_wn_loss
     assert lw_train == lw_eval
+
+
+# ---- chain_rule flag (v5 independence vs v7c chain-rule) ----
+
+
+def test_chain_rule_default_true(v5_cfg):
+    """Default builds keep v7c chain-rule behavior (backward compat)."""
+    model = build_model("transformer", v5_cfg)
+    assert model.chain_rule is True
+
+
+def test_chain_rule_false_wn_flow_is_smaller(v5_cfg):
+    """chain_rule=False drops θ_g from the WN flow context (strictly fewer params)."""
+    cfg_cr = {**v5_cfg, "model": {**v5_cfg["model"], "chain_rule": True}}
+    cfg_ind = {**v5_cfg, "model": {**v5_cfg["model"], "chain_rule": False}}
+    m_cr = build_model("transformer", cfg_cr)
+    m_ind = build_model("transformer", cfg_ind)
+    n_cr = sum(p.numel() for p in m_cr.wn_flow.parameters())
+    n_ind = sum(p.numel() for p in m_ind.wn_flow.parameters())
+    assert n_ind < n_cr, (
+        f"Independence WN flow should have fewer params than chain-rule: {n_ind} vs {n_cr}"
+    )
+
+
+def test_chain_rule_false_forward_and_sample(v5_cfg):
+    """chain_rule=False: forward + sample_posterior run and return finite values."""
+    cfg = {**v5_cfg, "model": {**v5_cfg["model"], "chain_rule": False}}
+    model = build_model("transformer", cfg)
+    batch = _make_factorized_batch(B=2)
+    loss = model(batch)
+    assert torch.isfinite(loss)
+    model.eval()
+    gs, ws = model.sample_posterior(batch, n_samples=32)
+    assert gs.shape == (2, 32, 4)
+    assert ws.shape == (2, 4, 32, 3)
+    assert torch.all(torch.isfinite(gs)) and torch.all(torch.isfinite(ws))
+
+
+def test_chain_rule_false_wn_loss_independent_of_theta_g(v5_cfg):
+    """Under independence, WN loss must NOT change when θ_g is perturbed."""
+    cfg = {**v5_cfg, "model": {**v5_cfg["model"], "chain_rule": False}}
+    torch.manual_seed(0)
+    model = build_model("transformer", cfg)
+    model.eval()
+    batch = _make_factorized_batch(B=2)
+    batch_b = dict(batch)
+    batch_b["theta_global"] = batch["theta_global"] + 5.0
+    with torch.no_grad():
+        model(batch)
+        lw_a = model._last_wn_loss
+        model(batch_b)
+        lw_b = model._last_wn_loss
+    assert lw_a == lw_b, (
+        f"Independence WN loss must be invariant to θ_g: {lw_a} vs {lw_b}"
+    )

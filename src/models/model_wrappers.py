@@ -225,6 +225,7 @@ class FactorizedNPEModel(nn.Module):
         wn_context_proj_dim: int | None = None,
         theta_g_dim: int = 4,
         theta_g_noise_std: float = 0.0,
+        chain_rule: bool = True,
     ):
         super().__init__()
         self.encoder = encoder
@@ -234,6 +235,9 @@ class FactorizedNPEModel(nn.Module):
         self.n_backends_max = n_backends_max
         self.wn_loss_weight = wn_loss_weight
         self.theta_g_dim = theta_g_dim
+        # When False, the WN flow is q_wn(θ_wn | x) — v5 independence
+        # factorization. When True, q_wn(θ_wn | x, θ_g) — v7c chain rule.
+        self.chain_rule = chain_rule
         # Small Gaussian noise on teacher-forced θ_g (normalized space) in the
         # WN branch only. Training-only, closes the gap to q_g(·|x) at inference
         # and prevents the WN flow from collapsing onto exact θ_g coordinates.
@@ -382,16 +386,19 @@ class FactorizedNPEModel(nn.Module):
             global_lp = self.global_flow.log_prob(tg_norm.float(), global_ctx.float())
         global_loss = -global_lp.mean()
 
-        # Per-backend WN flow loss: condition WN context on teacher-forced θ_g.
-        # At training only, optionally perturb the teacher signal with small
-        # Gaussian noise — keeps the chain-rule loss an unbiased estimator of
-        # the smoothed conditional and stops the flow locking onto exact
-        # θ_g coordinates (see v7c catastrophic overfit).
-        tg_for_wn = tg_norm
-        if self.training and self.theta_g_noise_std > 0.0:
-            tg_for_wn = tg_norm + self.theta_g_noise_std * torch.randn_like(tg_norm)
-        tg_exp = tg_for_wn.unsqueeze(1).expand(-1, self.n_backends_max, -1)  # (B, Bmax, 4)
-        wn_ctx_ar = torch.cat([wn_ctx, tg_exp], dim=-1)  # (B, Bmax, wn_ctx+4)
+        # Per-backend WN flow loss. Under chain_rule=True, condition on
+        # teacher-forced θ_g (optionally with training-only Gaussian noise so
+        # the WN flow sees a smoothed label instead of an exact oracle).
+        # Under chain_rule=False, the WN flow is q_wn(θ_wn | x) — v5
+        # independence factorization, no θ_g pass-through.
+        if self.chain_rule:
+            tg_for_wn = tg_norm
+            if self.training and self.theta_g_noise_std > 0.0:
+                tg_for_wn = tg_norm + self.theta_g_noise_std * torch.randn_like(tg_norm)
+            tg_exp = tg_for_wn.unsqueeze(1).expand(-1, self.n_backends_max, -1)
+            wn_ctx_ar = torch.cat([wn_ctx, tg_exp], dim=-1)
+        else:
+            wn_ctx_ar = wn_ctx
 
         theta_wn = batch["theta_wn"]  # (B, Bmax, 3)
         backend_active = batch["backend_active"]  # (B, Bmax) bool
@@ -436,9 +443,12 @@ class FactorizedNPEModel(nn.Module):
         global_samples = self._denormalize_global(gs_norm)
 
         # Expand θ_g and wn_ctx to (B, Bmax, S, .) then cat + flatten for batched flow call
-        gs_norm_exp = gs_norm.unsqueeze(1).expand(B, Bmax, S, -1)  # (B, Bmax, S, 4)
         wn_ctx_exp = wn_ctx.unsqueeze(2).expand(B, Bmax, S, -1)  # (B, Bmax, S, wctx)
-        wn_ctx_ar = torch.cat([wn_ctx_exp, gs_norm_exp], dim=-1)
+        if self.chain_rule:
+            gs_norm_exp = gs_norm.unsqueeze(1).expand(B, Bmax, S, -1)  # (B, Bmax, S, 4)
+            wn_ctx_ar = torch.cat([wn_ctx_exp, gs_norm_exp], dim=-1)
+        else:
+            wn_ctx_ar = wn_ctx_exp
         wn_ctx_flat = wn_ctx_ar.reshape(B * Bmax * S, -1)
         ws_norm_flat = self.wn_flow.sample(wn_ctx_flat, 1).squeeze(1)  # (B*Bmax*S, 3)
         ws_norm = ws_norm_flat.reshape(B, Bmax, S, 3)
@@ -481,13 +491,18 @@ def _build_factorized_model(model_type: str, cfg: dict) -> FactorizedNPEModel:
     global_theta_std = (g_hi - g_lo) / 2
 
     # WN flow context dim: encoder-derived context (optionally bottlenecked)
-    # plus θ_g (autoregressive conditioning, pass-through — not bottlenecked).
+    # plus θ_g when chain_rule=True (autoregressive conditioning, pass-through
+    # — not bottlenecked). When chain_rule=False, the WN flow is
+    # q_wn(θ_wn | x) only (v5 independence factorization).
+    chain_rule = mcfg.get("chain_rule", True)
     theta_g_dim = len(g_names)
     wn_flow_ctx_raw = (
         global_flow_ctx_raw + context_dim + (N_BACKEND_AUX_FEATURES if use_aux else 0)
     )
     wn_ctx_proj_dim = mcfg.get("wn_context_proj_dim", None)
-    wn_flow_ctx = (wn_ctx_proj_dim if wn_ctx_proj_dim else wn_flow_ctx_raw) + theta_g_dim
+    wn_flow_ctx = wn_ctx_proj_dim if wn_ctx_proj_dim else wn_flow_ctx_raw
+    if chain_rule:
+        wn_flow_ctx = wn_flow_ctx + theta_g_dim
 
     w_names = list(wn_cfg.keys())
     w_lo = torch.tensor([wn_cfg[k][0] for k in w_names], dtype=torch.float32)
@@ -559,4 +574,5 @@ def _build_factorized_model(model_type: str, cfg: dict) -> FactorizedNPEModel:
         wn_context_proj_dim=wn_ctx_proj_dim,
         theta_g_dim=theta_g_dim,
         theta_g_noise_std=mcfg.get("theta_g_noise", 0.0),
+        chain_rule=chain_rule,
     )

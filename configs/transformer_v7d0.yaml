@@ -1,0 +1,94 @@
+# v7d0 — v5 anchor on the current data regime.
+#
+# Step 1 of the ablation plan. Re-establishes v5's ESS-17.5% result on HEAD
+# by turning off the chain-rule θ_g pass-through (hard-coded since v7c) and
+# switching the data regime to the v7* setup (1M train, Sobol, 2 backends,
+# prior [-17,-11]). No model/regularization drift from v5.
+#
+# Success: ESS ≥ 15%. Kill: train/val gap > 3 nats by ep10, or ESS < 10%.
+# If kill hits, the current code or data regime has drifted from the v5 era;
+# diagnose before running v7d.
+
+data:
+  train_samples: 1000000
+  val_samples: 10000
+  test_samples: 5000
+  n_fourier_modes: 30
+  n_toa_min: 80
+  n_toa_max: 400
+  tspan_min_yr: 5.0
+  tspan_max_yr: 15.0
+  jitter: 1.0e-20
+  use_sobol: true
+  reseed_per_epoch: true
+  n_backends_fixed: 2
+  train_masking_severity: 0.5
+  val_masking_severity: 0.15
+
+prior:
+  global:
+    log10_A_red: [-17, -11]
+    gamma_red: [1.0, 7.0]
+    log10_A_dm: [-17, -11]
+    gamma_dm: [1.0, 7.0]
+  white_noise:
+    EFAC: [0.5, 2.0]
+    log10_EQUAD: [-8, -5]
+    log10_ECORR: [-8, -5]
+
+model:
+  factorized: true
+  chain_rule: false
+  n_backends_max: 2
+  context_dropout: 0.2
+  wn_loss_weight: 0.3
+  global_context_proj_dim: 48
+  wn_context_proj_dim: 32
+
+  d_model: 256
+  nhead: 8
+  num_layers: 6
+  dim_feedforward: 1024
+  dropout: 0.1
+  context_dim: 128
+  use_rope: true
+  use_aux_features: true
+
+  lstm_hidden: 256
+  lstm_layers: 3
+
+  global_flow_transforms: 6
+  global_flow_hidden: 128
+  global_flow_layers: 2
+  global_flow_bins: 8
+
+  wn_flow_transforms: 6
+  wn_flow_hidden: 128
+  wn_flow_layers: 2
+  wn_flow_bins: 8
+
+training:
+  epochs: 200
+  batch_size: 256
+  lr: 3.0e-4
+  weight_decay: 5.0e-4
+  flow_weight_decay: 2.0e-3
+  grad_clip: 1.0
+  patience: 40
+  seed: 42
+  warmup_fraction: 0.1
+  ema_alpha: 0.15
+  use_amp: true
+  num_workers: 4
+
+eval:
+  n_grid: 200
+  n_posterior_samples: 10000
+  n_test_exact: 100
+  masking_levels: [0.0, 0.15, 0.3, 0.45, 0.6]
+  importance_sampling:
+    enabled: true
+    n_examples: 50
+    n_samples: 10000
+
+output_dir: outputs/v7d0
