@@ -405,18 +405,78 @@ For factorized models, IS is performed on the **global flow only**, with WN para
   - Epoch 2: train=3.031, val=3.505
 - **Status**: Very early, insufficient data to evaluate
 
+### v7 Series — Scaling, Chain-Rule Factorization, and the HEAD-Era Ablation Plan
+
+The v7 arc set out to scale beyond v5/v6 and crystallized into a systematic ablation that uncovered a fundamental eval-code issue and eventually found a new champion (v7e_cap_half). It runs in three phases: monolithic-scaling (v7a, v7b, v7b_ecorr), chain-rule factorization retries (v7c/v7c2/v7c3), and the clean HEAD-era ablation plan (v7d0, v7d0_v5exact, v7d, v7e_cap_half, v7e_cap).
+
+#### Metric-Drift Discovery (critical caveat)
+
+Partway through v7, a rewrite of `src/evaluate.py` and `src/importance_sampling.py` changed two things:
+
+1. **Hellinger formula bug fix** — the v5-era code used a normalized `√p` comparison that systematically under-reported Hellinger by ~1-2 orders of magnitude. v5's reported H=0.018 is truly on the order of 0.4-0.5 under the corrected metric.
+2. **Importance sampling 4D → full 10D joint** — v5-era IS only evaluated the 4D global parameters. The HEAD eval uses the full 10D joint (4 global + 3 WN × 2 backends). Full 10D IS is a much harder metric, so ESS fractions drop accordingly.
+
+**Consequence:** v3–v7b eval metrics are NOT directly comparable to v7d–v7e eval metrics. The "v5 achieved ESS=17.5%" and "v4d achieved H=0.0035" headline numbers are eval-code artifacts of the older pipeline. Under HEAD eval, the realistic v5-class baseline ESS is ~1.4% (verified: v7d0_v5exact reproduces this from scratch). See `memory/project_metric_drift.md`.
+
+#### Phase 1 — Monolithic 10D Scaling
+
+**v7a** (monolithic 10D baseline). Same architecture as v4e but expanded to theta_dim=10 (4 global + 2×3 WN, N_backends_fixed=2). Factorized=false. Under pre-fix eval: H=0.017, ESS_frac=8.2%, KS_IS=0.17. Diagnosed ESS<10 tail on ~20% of cases at high log10_ECORR — motivates v7b scaling.
+
+**v7b** (scaled monolithic). Same as v7a but flow 16 transforms × 384 hidden × 24 bins, 1M training samples, lower LR. Marginal-KS improved (0.076 mask=0) but structural ~15% ESS-collapse tail did NOT close — capacity scaling alone can't solve the WN↔red-noise coupling pathology at prior-edge regions. Under pre-fix eval: H=0.464, ESS_frac=9.5%.
+
+**v7b_ecorr** (ECORR-prior probe). Variant sweeping ECORR prior; confirmed the structural tail lives in the log10_ECORR_1 loud region independent of prior width. H=0.484, ESS_frac=7.2% (pre-fix).
+
+**Takeaway from Phase 1:** Monolithic scaling does not close the WN-coupling tail. Factorization needs revisiting, this time with a principled coupling structure.
+
+#### Phase 2 — Chain-Rule Factorized Retries (all failed, diagnostic)
+
+The v5 failure mode ("global collapsed under 48D bottleneck") was re-interpreted as "independence `q(θ_g|x)·∏_b q(wn_b|x)` drops the critical WN↔red-noise coupling." v7c family introduced the correct chain-rule factorization `q(θ_g|x) · ∏_b q(wn_b | x, θ_g)` via teacher-forced θ_g pass-through into the WN context.
+
+- **v7c** — chain-rule + 16× global flow capacity + 96D bottleneck + no masking. By ep30: 37-nat train/val gap, WN flow catastrophic overfit. The 96D bottleneck (inherited from v6c) plus the teacher-forced θ_g created a new memorization pathway (the WN flow locks onto exact θ_g labels).
+- **v7c2** — reverted bottleneck to v5's 48D/32D, added θ_g teacher noise σ=0.05. Early-stopped ep63 at val=5.55. σ=0.05 too small; WN val climbed monotonically.
+- **v7c3** — more aggressive θ_g regularization (higher noise). Early-stopped ep63 at val=5.16. Still catastrophic.
+
+**Takeaway from Phase 2:** Chain-rule with teacher-forced θ_g + any of the v6/v7c training-recipe deltas (removed masking, larger flow, higher wn_loss_weight, or 96D bottleneck) causes WN-flow memorization. The confounding is severe; a clean single-knob test is needed.
+
+#### Phase 3 — HEAD-Era Ablation Plan (disciplined single-knob sweep)
+
+Each step tests ONE change versus a known-good baseline.
+
+**v7d0** (data-regime regression test). Attempted "chain-rule + v5 data regime" but tripped the 3-nat kill criterion at ep10 (gap 5.84 nats). Triggered the data-regime diagnostic.
+
+**v7d0_v5exact** (Step 1 — data-regime anchor). Reverted four knobs to v5 values: `train_samples 1M → 500k`, `use_sobol true → false`, removed `n_backends_fixed=2`, prior `[-17,-11] → [-18,-11]`. Independence factorization, no chain-rule. **HEAD-era baseline: ESS=142 (1.42%), KS_IS=0.124, H(mask=0)=0.512.** Reproduces v5's checkpoint ESS of 150 on the same HEAD eval — confirms v5's "headline ESS=17.5%" was eval-code, not a training regression. See `memory/project_metric_drift.md`.
+
+**v7d** (Step 2 — chain-rule isolation). Only change from v7d0_v5exact: `chain_rule: false → true` with θ_g teacher noise σ=0.05. **Result: ESS=96 (0.96%), a 32% regression vs anchor.** Best val loss improved (0.82 vs 0.96) but ESS dropped — the factorized loss improved by sharpening incorrect conditionals. DM sector (log10_A_dm, γ_dm) degraded most. **Verdict: chain-rule with teacher-forced θ_g is actively harmful on this problem**; the failure mode is mechanistic, not a σ-tuning issue. See `memory/project_v7d_chain_rule_verdict.md`.
+
+**v7e_cap_half** (Step 3a — intermediate capacity scaling). Only change from v7d0_v5exact: scale global flow `6×128×2×8 → 8×256×2×12` (~165k → ~1.0M params). All v5 regularizers preserved. Independence factorization. **Result: ESS=279 (2.79%), +96% over anchor. Median ESS 76 vs anchor 22. ESS>200: 15/50 vs 8/50.** Best val 0.087 vs anchor 0.96 — training-loss improvement translated cleanly to IS quality. **The v5 sizing was under-parameterized for the 4D global posterior; ~1M params is the right default.** Current HEAD-era champion. See `memory/project_v7e_cap_half_verdict.md`.
+
+**v7e_cap** (Step 3a — full capacity). Scale further: `10×256×3×16` (~2.6M params, 2.5× v7e_cap_half). Trained to ep199. Best_model.pt saved ~ep40-50 (composite `ema_global + ema_wn` selection); pg climbed to 102 by ep177 while WN kept resetting pw. **Result: ESS=285 mean (ESS median regressed 76 → 40, ESS>200 count regressed 15 → 9).** Mean tied because a single outlier case (ESS=5436) and a few large ones propped it up while the bulk regressed. **Verdict: saturation (slight regression on distribution). v7e_cap_half is the capacity sweet spot** — 2.6M overfits the 500k-sample regime faster than it converges. See `memory/project_v7e_cap_verdict.md`.
+
 ### Summary Table of All Full-Scale Runs
 
-| Version | Params | Best Val Loss | Epochs | H (mask=0) | KS (mask=0) | PE (mask=0) | Key Finding |
-|---------|--------|---------------|--------|------------|-------------|-------------|-------------|
-| v3 Transformer | 6.75M | −1.053 | 59 | 0.0075 | 0.108 | 0.663 | RoPE + wide encoder baseline |
-| v3 LSTM | 6.31M | −0.980 | 48 | 0.0089 | 0.065 | 0.690 | Surprisingly good calibration |
-| v4d Transformer | 7.63M | −1.565 | 76 | 0.0035 | 0.082 | 0.665 | Best Hellinger ever achieved |
-| v4d LSTM | 6.93M | −1.004 | 63 | 0.0069 | 0.072 | 0.663 | Solid baseline |
-| v5 Transformer | 5.81M | 0.702 | 165 | 0.0183 | 0.176 | 0.971 | Factorized but regressed |
-| v5_f12 Transformer | 6.69M | −0.051 | 187 | 0.0170 | 0.111 | 0.948 | Improved factorized |
-| v6 Transformer | 8.42M | — | 9+ | — | — | — | Catastrophic overfitting |
-| v6b Transformer | 7.91M | — | 25+ | — | — | — | Still overfitting |
+⚠️ **Pre-v7c (v3 through v7b_ecorr) rows use the v5-era eval pipeline** (buggy Hellinger + 4D-only IS). They are NOT directly comparable to v7d+ rows, which use corrected HEAD eval (full 10D joint IS, fixed Hellinger formula). See Metric-Drift Discovery above.
+
+| Version | Params | Best Val | Epochs | H (mask=0) | KS (mask=0) | ESS_frac | Eval era | Key finding |
+|---------|--------|----------|--------|------------|-------------|----------|----------|-------------|
+| v3 Transformer | 6.75M | −1.053 | 59 | 0.0075 | 0.108 | — | v5-era | RoPE + wide encoder baseline |
+| v3 LSTM | 6.31M | −0.980 | 48 | 0.0089 | 0.065 | — | v5-era | Surprisingly good calibration |
+| v4d Transformer | 7.63M | −1.565 | 76 | 0.0035 | 0.082 | — | v5-era | Headline "best Hellinger" was eval artifact |
+| v4d LSTM | 6.93M | −1.004 | 63 | 0.0069 | 0.072 | — | v5-era | Solid baseline |
+| v5 Transformer | 5.81M | 0.702 | 165 | 0.0183 | 0.176 | 17.5%* | v5-era | Headline regression also eval-code artifact |
+| v5_f12 Transformer | 6.69M | −0.051 | 187 | 0.0170 | 0.111 | 23.8%* | v5-era | Slightly larger global flow |
+| v6 Transformer | 8.42M | — | 9+ | — | — | — | — | Catastrophic overfitting, aborted |
+| v6b Transformer | 7.91M | — | 25+ | — | — | — | — | Still overfitting, abandoned |
+| v7a Transformer | — | — | — | 0.0170 | 0.072 | 8.2%* | pre-fix | Monolithic 10D; structural tail at high ECORR |
+| v7b Transformer | — | — | — | 0.464 | 0.076 | 9.5%* | mixed | Scaled monolithic; tail NOT closed |
+| v7b_ecorr Transformer | — | — | — | 0.484 | 0.082 | 7.2%* | mixed | ECORR-prior probe |
+| v7c / v7c2 / v7c3 | — | 5.2-5.6 | 30-63 | — | — | — | — | Chain-rule + confounds → catastrophic overfit |
+| v7d0_v5exact | — | 0.958 | 166 | 0.512 | 0.156 | **1.42%** | HEAD | Independence baseline — true v5-class ESS |
+| v7d (chain-rule) | — | 0.818 | 117 | 0.502 | 0.161 | 0.96% | HEAD | Chain-rule+σ regressed 32% vs anchor |
+| **v7e_cap_half** | — | 0.087 | 169 | **0.470** | 0.106 | **2.79%** | HEAD | **CHAMPION** (+96% ESS vs anchor) |
+| v7e_cap (2.6M global) | — | ~0.93 | 199 | 0.489 | 0.143 | 2.85%† | HEAD | Saturation; median ESS 76→40 |
+
+\* Pre-fix / mixed eval — not comparable to HEAD rows.
+† Mean tied with v7e_cap_half due to a single outlier (ESS=5436); median dropped 76→40, ESS>200 count dropped 15→9.
 
 ---
 
@@ -492,18 +552,31 @@ Single-notebook walkthrough of the entire pipeline from simulation to amortized 
 
 ## 12. Current Status and Open Questions
 
-### Status (as of latest logs)
-- **v4d remains the best-performing model** on global posterior quality (Hellinger=0.0035)
-- **v5's factorization** successfully improved WN calibration but degraded global posterior quality
-- **v6/v6b** attempts to fix the v5 regression by restoring flow capacity show promising training loss descent but suffer from overfitting that hadn't yet converged at the point logs were captured
-- The fundamental tension between **flow capacity** (needs to be large for expressiveness) and **regularization** (needed to prevent overfitting in the encoder-flow system) remains the central open problem
+### Status (as of v7e_cap eval, 2026-04-23)
+
+- **v7e_cap_half is the HEAD-era champion** on the corrected eval pipeline: ESS=279 (2.79%), median ESS=76, KS_IS=0.101, H(mask=0)=0.470. ~1M global-flow params (8×256×2×12) is the capacity sweet spot under v5's data + regularization regime. See `memory/project_v7e_cap_half_verdict.md`.
+- **The pre-v7c "best Hellinger ever" claim for v4d (H=0.0035) was an eval-code artifact** (buggy Hellinger normalization + 4D-only IS). Under HEAD eval, the realistic v5-class ESS is ~1.4%, not 17.5%. See `memory/project_metric_drift.md`.
+- **Chain-rule factorization with teacher-forced θ_g was actively harmful** (v7d ESS=96 vs anchor 142, −32%). The failure mode is mechanistic (the WN flow learns to cross-reference x against θ_g labels), not a noise-σ tuning issue.
+- **Step 3a (capacity scaling) is closed.** v7e_cap (2.6M params, 2.5× v7e_cap_half) saturates on mean and regresses on median (76→40) — the larger global flow overfits the 500k-sample regime faster than it converges, and best_model.pt locks in at ep40-50.
+- The fundamental ESS gap remains: even the champion sits at ~3% ESS, far from typical NPE benchmarks. Capacity has been diagnosed and resolved as one limiter; the next limiters are likely structural (flow family, factorization choice, data scale).
+
+### Recent ablation arc (HEAD-era Step 1-3a)
+
+| Step | Run | Single-knob change | ESS_frac | Verdict |
+|------|-----|--------------------|----------|---------|
+| 0 (anchor) | v7d0_v5exact | v5-equivalent data regime | 1.42% | Baseline confirmed |
+| 1 (data regime) | v7d0_v5exact vs v7d0 | Reverted Sobol+n_fixed+1M+wider prior | — | v7d0 broke; v5 regime is the right anchor |
+| 2 (chain-rule) | v7d | + chain_rule + θ_g σ=0.05 | 0.96% | FAIL (-32%) |
+| 3a-half (capacity) | v7e_cap_half | + global flow 6× scaling | **2.79%** | **WIN (+96%)** |
+| 3a-full (capacity) | v7e_cap | + global flow 16× scaling | 2.85% mean / 40 median | Saturation/regression |
 
 ### Open Questions
-1. **Can v6b converge?** The 25 epochs captured may be too early to judge — the cosine LR schedule hadn't yet declined significantly. Full 200-epoch runs may show different behavior.
-2. **Does the factorized architecture need a fundamentally different training recipe?** Perhaps separate learning rates for encoder vs. global flow vs. WN flow.
-3. **Would SpecAugment-style masking** (applied to the token sequence directly, not the observing schedule) be a better augmentation strategy?
-4. **Can importance sampling fully correct** the v5 posterior? ESS fractions of 0.17–0.24 suggest the proposal is reasonable but not excellent.
-5. **Scaling to multi-pulsar PTA**: The factorized per-backend WN flow is explicitly designed to enable this, but it hasn't been tested.
+
+1. **Is the next limiter the global flow's *dependency-graph expressiveness* (coupling-NSF vs autoregressive)?** v7e_cap_half's coupling-NSF on a 4D posterior with known curved/banana ridges may be limited by the 2/2 split structure. Single-knob test: swap to MAF (cleaner hypothesis test) or autoregressive-NSF (strict superset).
+2. **Does v7e_cap_half generalize to N=3+ backends?** This is the original payoff of choosing factorization. Untested.
+3. **Is the WN flow now the bottleneck?** With global at 1M params and WN still at 165k, the architecture is lopsided. Single-knob: scale WN flow to ~1M.
+4. **Would v7e_cap unlock at 1-2M training samples?** The 2.6M-param overfit was diagnosed as data-bound, not capacity-bound per se.
+5. **Multi-pulsar PTA scaling**: per-backend WN factorization was designed for this; still untested.
 
 ---
 

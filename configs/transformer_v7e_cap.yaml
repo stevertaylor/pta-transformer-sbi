@@ -1,23 +1,28 @@
 # v7e_cap — Step 3a: single-knob relaxation of v5 flow capacity.
 #
-# Baseline is whichever of v7d0/v7d wins Step 2. This file is written as a
-# delta from v7d0 (the conservative winner). If v7d wins Step 2, before
-# running set:
-#   model.chain_rule: true
-#   model.theta_g_noise: 0.05
-# and leave everything else in this file unchanged.
+# Step 2 verdict (2026-04-20): v7d (chain_rule=true, theta_g_noise=0.05)
+# LOST to v7d0_v5exact (independence factorization). ESS 96 vs 142. Baseline
+# for Step 3 stays v7d0_v5exact. chain_rule stays OFF.
 #
 # Single knob changed from baseline: global flow 6×128×2×8 → 10×256×3×16
 # (~165k → ~2.6M params). Everything else (WN flow, proj dims, dropout,
-# masking, wn_loss_weight) stays at v5 values.
+# masking, wn_loss_weight, data regime) stays at v5 / v7d0_v5exact values.
 #
-# Per-variant success: ESS ≥ ESS(baseline); no train/val divergence.
+# Data regime: v5-equivalent (500k iid, no Sobol, no n_fixed, full prior).
+# This is the anchor that reached ESS=142 on HEAD eval — the one that Step 2
+# confirmed as the correct Step 3 baseline.
+#
+# Only launch after v7e_cap_half passes (ESS ≥ 142, no divergence at ep10).
+# If v7e_cap_half fails, don't run this — flow capacity is not the right
+# direction and escalating further would burn GPU on a dead branch.
+#
+# Per-variant success: ESS ≥ 142; no train/val divergence.
 # Per-variant kill:    train/val gap > 3 nats by ep10 → capacity is the
 #                      amplifier; document and stop this branch.
 
 data:
-  train_samples: 1000000
-  val_samples: 10000
+  train_samples: 500000
+  val_samples: 50000
   test_samples: 5000
   n_fourier_modes: 30
   n_toa_min: 80
@@ -25,17 +30,16 @@ data:
   tspan_min_yr: 5.0
   tspan_max_yr: 15.0
   jitter: 1.0e-20
-  use_sobol: true
+  use_sobol: false
   reseed_per_epoch: true
-  n_backends_fixed: 2
   train_masking_severity: 0.5
   val_masking_severity: 0.15
 
 prior:
   global:
-    log10_A_red: [-17, -11]
+    log10_A_red: [-18, -11]
     gamma_red: [1.0, 7.0]
-    log10_A_dm: [-17, -11]
+    log10_A_dm: [-18, -11]
     gamma_dm: [1.0, 7.0]
   white_noise:
     EFAC: [0.5, 2.0]
@@ -45,7 +49,7 @@ prior:
 model:
   factorized: true
   chain_rule: false
-  n_backends_max: 2
+  n_backends_max: 4
   context_dropout: 0.2
   wn_loss_weight: 0.3
   global_context_proj_dim: 48
