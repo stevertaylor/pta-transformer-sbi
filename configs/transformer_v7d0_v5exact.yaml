@@ -1,6 +1,28 @@
-# v5 config – factorized amortization for RTX 4090
-# Separate global 4D flow + shared per-backend 3D WN flow
-# Addresses EFAC miscalibration and enables variable backend counts
+# v7d0_v5exact — v5's EXACT data regime on current HEAD.
+#
+# Diagnostic run after v7d0 tripped the 3-nat kill criterion at ep10
+# (gap 5.84 nats vs v5's ~0.56). Tests whether the drift is data-regime
+# or code.
+#
+# Deltas from v7d0 (four knobs, all reverted to v5 values):
+#   data.train_samples:    1_000_000 → 500_000
+#   data.val_samples:         10_000 →  50_000
+#   data.use_sobol:             true → false     (v5 used iid sampling)
+#   data.n_backends_fixed:         2 → removed   (variable 1–3 per v5)
+#   prior.*.log10_A_*:   [-17,-11] → [-18,-11]
+#   model.n_backends_max:          2 → 4         (match n_backends variable)
+#
+# Everything else (model architecture, regularization, chain_rule=false,
+# training hyperparams) matches v7d0 exactly.
+#
+# If this run reproduces v5's tight gap (<1 nat by ep10) → drift is data
+# regime, and we need to decide how to handle the current regime.
+# If this run still has a large gap (>3 nats by ep10) → drift is in code
+# (schedule generator / new log_f feature / deterministic val masking).
+#
+# Success: gap < 1 nat at ep10 (matches v5 empirically).
+# Kill:    gap > 3 nats by ep10 → code drift; escalate to single-knob.
+
 data:
   train_samples: 500000
   val_samples: 50000
@@ -13,8 +35,6 @@ data:
   jitter: 1.0e-20
   use_sobol: false
   reseed_per_epoch: true
-  # Fix 4: align train/val masking distribution to reduce encoder
-  # distribution-shift between training and evaluation.
   train_masking_severity: 0.5
   val_masking_severity: 0.15
 
@@ -38,7 +58,6 @@ model:
   global_context_proj_dim: 48
   wn_context_proj_dim: 32
 
-  # Transformer encoder
   d_model: 256
   nhead: 8
   num_layers: 6
@@ -48,17 +67,14 @@ model:
   use_rope: true
   use_aux_features: true
 
-  # LSTM (shared config key, unused for transformer)
   lstm_hidden: 256
   lstm_layers: 3
 
-  # Global flow (4D: A_red, gamma_red, A_dm, gamma_dm)
   global_flow_transforms: 6
   global_flow_hidden: 128
   global_flow_layers: 2
   global_flow_bins: 8
 
-  # WN flow (3D: EFAC, EQUAD, ECORR — shared across backends)
   wn_flow_transforms: 6
   wn_flow_hidden: 128
   wn_flow_layers: 2
@@ -88,4 +104,4 @@ eval:
     n_examples: 50
     n_samples: 10000
 
-output_dir: outputs/v5
+output_dir: outputs/v7d0_v5exact

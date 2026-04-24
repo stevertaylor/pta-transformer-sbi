@@ -1,6 +1,26 @@
-# v5 config – factorized amortization for RTX 4090
-# Separate global 4D flow + shared per-backend 3D WN flow
-# Addresses EFAC miscalibration and enables variable backend counts
+# v7d — v7d0_v5exact anchor + chain-rule, nothing else.
+#
+# Step 2 of the ablation plan. Isolates the effect of the autoregressive
+# θ_g pass-through on top of v5's full regularization and v5's data regime.
+# This is the clean version of the v7c/v7c2/v7c3 experiment — those runs
+# bundled chain-rule with 16× flow capacity + removed dropout + removed
+# masking + raised wn weight, confounding the hypothesis test.
+#
+# Data regime: inherits v7d0_v5exact (the validated v5-equivalent anchor).
+# ESS anchor: v7d0_v5exact achieved ESS=142 (1.4%) on HEAD eval, matching
+# v5 checkpoint's 150 (1.5%) on the same metric.
+#
+# Deltas from v7d0_v5exact (exactly two knobs):
+#   model.chain_rule: false → true
+#   model.theta_g_noise: 0 → 0.05   (v7c2's σ; small enough that if chain-
+#                                    rule is genuinely productive under v5
+#                                    regularization, this σ suffices)
+#
+# Success: ESS(v7d) > 142 by ≥ 2 pp (≥ ~200 on 10000). Baseline for Step 3
+#          becomes v7d.
+# Kill:    train/val gap > 3 nats by ep10, or ESS ≤ 142. Baseline for Step 3
+#          stays v7d0_v5exact; independence is the correct factorization.
+
 data:
   train_samples: 500000
   val_samples: 50000
@@ -13,8 +33,6 @@ data:
   jitter: 1.0e-20
   use_sobol: false
   reseed_per_epoch: true
-  # Fix 4: align train/val masking distribution to reduce encoder
-  # distribution-shift between training and evaluation.
   train_masking_severity: 0.5
   val_masking_severity: 0.15
 
@@ -31,14 +49,14 @@ prior:
 
 model:
   factorized: true
-  chain_rule: false
+  chain_rule: true
+  theta_g_noise: 0.05
   n_backends_max: 4
   context_dropout: 0.2
   wn_loss_weight: 0.3
   global_context_proj_dim: 48
   wn_context_proj_dim: 32
 
-  # Transformer encoder
   d_model: 256
   nhead: 8
   num_layers: 6
@@ -48,17 +66,14 @@ model:
   use_rope: true
   use_aux_features: true
 
-  # LSTM (shared config key, unused for transformer)
   lstm_hidden: 256
   lstm_layers: 3
 
-  # Global flow (4D: A_red, gamma_red, A_dm, gamma_dm)
   global_flow_transforms: 6
   global_flow_hidden: 128
   global_flow_layers: 2
   global_flow_bins: 8
 
-  # WN flow (3D: EFAC, EQUAD, ECORR — shared across backends)
   wn_flow_transforms: 6
   wn_flow_hidden: 128
   wn_flow_layers: 2
@@ -88,4 +103,4 @@ eval:
     n_examples: 50
     n_samples: 10000
 
-output_dir: outputs/v5
+output_dir: outputs/v7d

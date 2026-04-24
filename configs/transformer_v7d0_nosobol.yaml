@@ -1,9 +1,24 @@
-# v5 config – factorized amortization for RTX 4090
-# Separate global 4D flow + shared per-backend 3D WN flow
-# Addresses EFAC miscalibration and enables variable backend counts
+# v7d0_nosobol — single-knob isolation on v7d0.
+#
+# v7d0 tripped the 3-nat kill at ep10 (gap 5.84). v7d0_v5exact (four knobs
+# reverted to v5) passed at ep10 (gap 0.65). This run isolates ONE knob:
+#
+#   use_sobol: true → false     (v5 used iid sampling)
+#
+# Mechanism suspected: src/dataset.py:131-132 documents that
+# `set_epoch has no effect when use_sobol=True (Sobol banks pre-generated)`.
+# With Sobol on + reseed_per_epoch=true, the reseed is silently defeated and
+# the model sees the *same 1M θ values every epoch*. With Sobol off, fresh θ
+# each epoch makes memorization harder.
+#
+# If this run passes (gap <1 nat by ep10) → Sobol/reseed interaction is the
+# primary data-regime driver. Commit to iid for Step 2 and beyond.
+# If this run fails (gap >3 nats by ep10) → Sobol is not the primary culprit;
+# need to test n_backends_fixed or prior range next.
+
 data:
-  train_samples: 500000
-  val_samples: 50000
+  train_samples: 1000000
+  val_samples: 10000
   test_samples: 5000
   n_fourier_modes: 30
   n_toa_min: 80
@@ -13,16 +28,15 @@ data:
   jitter: 1.0e-20
   use_sobol: false
   reseed_per_epoch: true
-  # Fix 4: align train/val masking distribution to reduce encoder
-  # distribution-shift between training and evaluation.
+  n_backends_fixed: 2
   train_masking_severity: 0.5
   val_masking_severity: 0.15
 
 prior:
   global:
-    log10_A_red: [-18, -11]
+    log10_A_red: [-17, -11]
     gamma_red: [1.0, 7.0]
-    log10_A_dm: [-18, -11]
+    log10_A_dm: [-17, -11]
     gamma_dm: [1.0, 7.0]
   white_noise:
     EFAC: [0.5, 2.0]
@@ -32,13 +46,12 @@ prior:
 model:
   factorized: true
   chain_rule: false
-  n_backends_max: 4
+  n_backends_max: 2
   context_dropout: 0.2
   wn_loss_weight: 0.3
   global_context_proj_dim: 48
   wn_context_proj_dim: 32
 
-  # Transformer encoder
   d_model: 256
   nhead: 8
   num_layers: 6
@@ -48,17 +61,14 @@ model:
   use_rope: true
   use_aux_features: true
 
-  # LSTM (shared config key, unused for transformer)
   lstm_hidden: 256
   lstm_layers: 3
 
-  # Global flow (4D: A_red, gamma_red, A_dm, gamma_dm)
   global_flow_transforms: 6
   global_flow_hidden: 128
   global_flow_layers: 2
   global_flow_bins: 8
 
-  # WN flow (3D: EFAC, EQUAD, ECORR — shared across backends)
   wn_flow_transforms: 6
   wn_flow_hidden: 128
   wn_flow_layers: 2
@@ -88,4 +98,4 @@ eval:
     n_examples: 50
     n_samples: 10000
 
-output_dir: outputs/v5
+output_dir: outputs/v7d0_nosobol

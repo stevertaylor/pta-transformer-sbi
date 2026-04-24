@@ -309,8 +309,14 @@ flowchart TB
 | v1 | 2D NPE, arbitrary units | Initial prototype |
 | v2 | 2D NPE, physical units | Enterprise/PTA convention |
 | v3 | 2D NPE + RoPE + aux features | Rotary embeddings, attention pooling, deeper flow |
-| v4 | 2D NPE, improved training | Longer runs, better regularization |
-| **v5** | **Factorized NPE (4D global + 3D WN)** | **Factorized amortization, epoch reseeding, per-group weight decay, flow-stability training** |
+| v4 | 7D NPE, improved training | Longer runs, better regularization, full noise model |
+| v5 | Factorized NPE (4D global + 3D WN) | Factorized amortization, BackendQueryPooling, epoch reseeding, per-group weight decay |
+| v6 | v5 + restored capacity, no regularization | Catastrophic overfitting; abandoned |
+| v7a / v7b | Monolithic 10D scaling | ~15% ESS-collapse tail at high log10_ECORR — capacity scaling alone insufficient |
+| v7c series | Chain-rule factorization (`q(θ_g\|x)·∏ q(wn\|x,θ_g)`) | Teacher-forced θ_g caused WN flow to memorize labels — catastrophic overfit |
+| v7d / v7d0_v5exact | HEAD-era ablation Step 1-2: data-regime anchor + clean chain-rule isolation | Eval-pipeline metric drift uncovered; chain-rule confirmed harmful (ESS −32% vs anchor) |
+| **v7e_cap_half** | **HEAD-era Step 3a: 6× global flow capacity (~1M params), independence factorization** | **CHAMPION** — ESS=279 (+96% vs anchor), median 76 vs 22 |
+| v7e_cap | 2.5× further scaling (~2.6M params) | Saturation: median ESS regressed 76→40, mean propped by outlier |
 
 ## Tutorials
 

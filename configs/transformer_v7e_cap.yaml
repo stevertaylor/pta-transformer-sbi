@@ -1,6 +1,25 @@
-# v5 config – factorized amortization for RTX 4090
-# Separate global 4D flow + shared per-backend 3D WN flow
-# Addresses EFAC miscalibration and enables variable backend counts
+# v7e_cap — Step 3a: single-knob relaxation of v5 flow capacity.
+#
+# Step 2 verdict (2026-04-20): v7d (chain_rule=true, theta_g_noise=0.05)
+# LOST to v7d0_v5exact (independence factorization). ESS 96 vs 142. Baseline
+# for Step 3 stays v7d0_v5exact. chain_rule stays OFF.
+#
+# Single knob changed from baseline: global flow 6×128×2×8 → 10×256×3×16
+# (~165k → ~2.6M params). Everything else (WN flow, proj dims, dropout,
+# masking, wn_loss_weight, data regime) stays at v5 / v7d0_v5exact values.
+#
+# Data regime: v5-equivalent (500k iid, no Sobol, no n_fixed, full prior).
+# This is the anchor that reached ESS=142 on HEAD eval — the one that Step 2
+# confirmed as the correct Step 3 baseline.
+#
+# Only launch after v7e_cap_half passes (ESS ≥ 142, no divergence at ep10).
+# If v7e_cap_half fails, don't run this — flow capacity is not the right
+# direction and escalating further would burn GPU on a dead branch.
+#
+# Per-variant success: ESS ≥ 142; no train/val divergence.
+# Per-variant kill:    train/val gap > 3 nats by ep10 → capacity is the
+#                      amplifier; document and stop this branch.
+
 data:
   train_samples: 500000
   val_samples: 50000
@@ -13,8 +32,6 @@ data:
   jitter: 1.0e-20
   use_sobol: false
   reseed_per_epoch: true
-  # Fix 4: align train/val masking distribution to reduce encoder
-  # distribution-shift between training and evaluation.
   train_masking_severity: 0.5
   val_masking_severity: 0.15
 
@@ -38,7 +55,6 @@ model:
   global_context_proj_dim: 48
   wn_context_proj_dim: 32
 
-  # Transformer encoder
   d_model: 256
   nhead: 8
   num_layers: 6
@@ -48,17 +64,15 @@ model:
   use_rope: true
   use_aux_features: true
 
-  # LSTM (shared config key, unused for transformer)
   lstm_hidden: 256
   lstm_layers: 3
 
-  # Global flow (4D: A_red, gamma_red, A_dm, gamma_dm)
-  global_flow_transforms: 6
-  global_flow_hidden: 128
-  global_flow_layers: 2
-  global_flow_bins: 8
+  # Step 3a knob: scale global flow 16×
+  global_flow_transforms: 10
+  global_flow_hidden: 256
+  global_flow_layers: 3
+  global_flow_bins: 16
 
-  # WN flow (3D: EFAC, EQUAD, ECORR — shared across backends)
   wn_flow_transforms: 6
   wn_flow_hidden: 128
   wn_flow_layers: 2
@@ -88,4 +102,4 @@ eval:
     n_examples: 50
     n_samples: 10000
 
-output_dir: outputs/v5
+output_dir: outputs/v7e_cap
